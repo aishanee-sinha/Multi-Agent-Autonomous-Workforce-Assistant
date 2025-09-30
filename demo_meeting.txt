@@ -1,0 +1,30 @@
+Meeting: Quarterly Product & Launch Readout
+Date: Monday, March 10, 2025, 10:00–10:45 AM PT
+Attendees: Priya Shah (PM), Alex Chen (Eng Lead), Jordan Lee (Design), Maria Gomez (Marketing), Sam Patel (Support)
+
+Agenda
+1) Q1 launch status
+2) Signup drop-off fixes
+3) GTM assets for the April release
+
+Discussion Notes
+• Priya: The April release scope is confirmed. We will keep the new onboarding flow and defer the advanced analytics tab to May.
+• Decision: Defer the “Advanced Analytics” tab to the May release to reduce risk.
+• Alex: The API timeout bug (#4821) is still happening for ~3% of requests in us-west. We should increase the connection pool and add retries.
+• Action: Alex to deploy the connection-pool change to staging by Wednesday and roll to production by Friday.
+• Jordan: The empty-state illustrations are ready. I will deliver the final Figma handoff to engineering by tomorrow 2 PM.
+• Action: Jordan to post the Figma link in #eng-app before EOD tomorrow.
+• Priya: We also need a fallback copy if the analytics service is down. Please draft a friendly message and share for review.
+• Action: Maria to draft the fallback copy and share a Google Doc with the team by next Tuesday.
+• Sam: Support is getting 18% of tickets about billing confusion. I will propose an FAQ update and a short macro for agents.
+• Action: Sam to create a billing FAQ update and a Zendesk macro by March 20.
+• Priya: For the April launch, we need a blog post, a 30-sec video, and one customer quote.
+• Decision: April GTM assets include a blog post, a 30-sec teaser video, and one customer quote.
+• Maria: I’ll coordinate with Customer Success to get a quote from Acme Corp this week.
+
+Parking Lot
+• A/B test for price page – discuss next sprint.
+• Data retention policy – legal review pending.
+
+Next Check-in
+• Wednesday, March 12, 2025 at 10:00 AM PT on Zoom.
