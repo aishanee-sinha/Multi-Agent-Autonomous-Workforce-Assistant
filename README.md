@@ -5,6 +5,7 @@ The Multi-Agent Autonomous Workforce Assistant is a project designed to streamli
 
 ## Project Structure
 - **DataPreprocessing.ipynb**: This notebook handles the preprocessing of Slack message data, including parsing XML files and cleaning the text for further analysis.
+- **DataLabeling.ipynb**: This notebook uses the Gemini model to label Slack messages with task-related information, such as task summaries, assignees, and issue creation dates.
 - **FinetuneLLM.ipynb**: This notebook is responsible for fine-tuning a language model (QLoRA) to extract task-related information from Slack messages and format it for Jira.
 - **Requirements**: The project requires several Python packages, including `pandas`, `transformers`, `sentence-transformers`, `requests`, and others specified in the notebooks.
 
@@ -17,8 +18,9 @@ pip install -r requirements.txt
 
 ## Usage
 1. **Data Preprocessing**: Run the `DataPreprocessing.ipynb` notebook to parse Slack message XML files and save the cleaned messages to a CSV file.
-2. **Fine-tuning the Model**: Execute the `FinetuneLLM.ipynb` notebook to fine-tune the language model on the preprocessed data.
-3. **Creating/Updating Jira Issues**: Use the provided functions to create or update Jira issues based on Slack messages. Ensure that your Jira credentials and project details are set in the environment variables.
+2. **Data Labeling**: Use the `DataLabeling.ipynb` notebook to label Slack messages with task-related information using the Gemini model. The labeled data will be saved for further processing.
+3. **Fine-tuning the Model**: Execute the `FinetuneLLM.ipynb` notebook to fine-tune the language model on the labeled data.
+4. **Creating/Updating Jira Issues**: Use the provided functions to create or update Jira issues based on Slack messages. Ensure that your Jira credentials and project details are set in the environment variables.
 
 ## Environment Variables
 Set the following environment variables for Jira integration:
