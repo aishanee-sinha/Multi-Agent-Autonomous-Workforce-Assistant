@@ -41,8 +41,3 @@ new_key = create_issue(slack_msg)
 print("Created:", new_key)
 ```
 
-## License
-This project is licensed under the MIT License. See the LICENSE file for more details.
-
-## Acknowledgments
-- Thanks to the contributors and libraries that made this project possible.
