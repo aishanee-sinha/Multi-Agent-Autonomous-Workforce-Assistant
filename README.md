@@ -50,4 +50,5 @@ A compact README summarizing the two notebooks in this repository.
 
 ## Execution Order
 
-- You can run each notebook independently. If they share artifacts (e.g., tokens, cached files), start with `calendarAPI.ipynb` if your workflow involves fetching calendar data before email processing.
+- You can run each notebook pipeline_email.ipynb get the output .ics file for the calendarAPI.ipynb file. The artifacts needed for running the pipeline_email.ipynb https://drive.google.com/drive/folders/1lkh8gaYWYcTcNW79zoDw1cb3JOPwsswp?usp=sharing  are in this drive link.
+- doenload the model from this link , give this as the model path for pipleine_email file.
