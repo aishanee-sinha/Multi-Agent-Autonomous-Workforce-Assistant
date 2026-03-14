@@ -1,0 +1,7 @@
+langchain
+langchain-openai
+langchain-core
+slack_sdk
+boto3
+pydantic>=2.0.0
+requests
