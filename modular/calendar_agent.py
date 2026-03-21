@@ -34,7 +34,31 @@ from state import (
 )
 
 logger = logging.getLogger(__name__)
+from functools import wraps
+import logging
 
+logger = logging.getLogger(__name__)
+
+def _logged_slack(client: WebClient) -> WebClient:
+    """Wrap every Slack API method to log the call and args before executing."""
+    original_api_call = client.api_call
+
+    @wraps(original_api_call)
+    def logged_api_call(api_method, *args, **kwargs):
+        # Log the method name and all arguments
+        safe_kwargs = {
+            k: (v[:50] + "..." if isinstance(v, str) and len(v) > 50 else v)
+            for k, v in kwargs.items()
+            if k not in ("token",)  # never log the token
+        }
+        logger.info(f"SLACK API CALL  : {api_method}")
+        logger.info(f"SLACK API ARGS  : {safe_kwargs}")
+        result = original_api_call(api_method, *args, **kwargs)
+        logger.info(f"SLACK API RESULT: ok={result.get('ok')} error={result.get('error','none')}")
+        return result
+
+    client.api_call = logged_api_call
+    return client
 # ─────────────────────────────────────────────────────────────────────────────
 # LLM system prompt
 # ─────────────────────────────────────────────────────────────────────────────
@@ -123,7 +147,7 @@ def email_post_slack_preview(state: OrchestratorState) -> OrchestratorState:
     The full pending_meeting dict is embedded in the button value
     so Lambda can reconstruct it on the next invocation — no DynamoDB needed.
     """
-    client = WebClient(token=SLACK_BOT_TOKEN)
+    client = _logged_slack(WebClient(token=SLACK_BOT_TOKEN))
 
     pending = {
         "email_data": state.email_data,
@@ -199,7 +223,7 @@ def email_create_calendar(state: OrchestratorState) -> OrchestratorState:
     pending_meeting is read from state (passed from button value by parse_input).
     Creates the Google Calendar event and updates the Slack card.
     """
-    client  = WebClient(token=SLACK_BOT_TOKEN)
+    client = _logged_slack(WebClient(token=SLACK_BOT_TOKEN))
     pending = state.pending_meeting
 
     if not pending:
@@ -244,7 +268,7 @@ def email_create_calendar(state: OrchestratorState) -> OrchestratorState:
 
 def email_post_cancel(state: OrchestratorState) -> OrchestratorState:
     """User clicked ❌ Cancel — update the Slack card."""
-    client = WebClient(token=SLACK_BOT_TOKEN)
+    client = _logged_slack(WebClient(token=SLACK_BOT_TOKEN))
     try:
         client.chat_update(
             channel=state.channel_id,

@@ -38,7 +38,31 @@ from state import (
 
 logger = logging.getLogger(__name__)
 
+from functools import wraps
+import logging
 
+logger = logging.getLogger(__name__)
+
+def _logged_slack(client: WebClient) -> WebClient:
+    """Wrap every Slack API method to log the call and args before executing."""
+    original_api_call = client.api_call
+
+    @wraps(original_api_call)
+    def logged_api_call(api_method, *args, **kwargs):
+        # Log the method name and all arguments
+        safe_kwargs = {
+            k: (v[:50] + "..." if isinstance(v, str) and len(v) > 50 else v)
+            for k, v in kwargs.items()
+            if k not in ("token",)  # never log the token
+        }
+        logger.info(f"SLACK API CALL  : {api_method}")
+        logger.info(f"SLACK API ARGS  : {safe_kwargs}")
+        result = original_api_call(api_method, *args, **kwargs)
+        logger.info(f"SLACK API RESULT: ok={result.get('ok')} error={result.get('error','none')}")
+        return result
+
+    client.api_call = logged_api_call
+    return client
 # ─────────────────────────────────────────────────────────────────────────────
 # Structured output schema
 # ─────────────────────────────────────────────────────────────────────────────
@@ -73,7 +97,7 @@ def slack_extract_ticket(state: OrchestratorState) -> OrchestratorState:
 
 def slack_post_preview(state: OrchestratorState) -> OrchestratorState:
     """Post the proposed ticket card with Approve / Cancel buttons to Slack."""
-    client = WebClient(token=SLACK_BOT_TOKEN)
+    client = _logged_slack(WebClient(token=SLACK_BOT_TOKEN))
     blocks = [
         {
             "type": "section",
@@ -145,23 +169,59 @@ def slack_create_jira(state: OrchestratorState) -> OrchestratorState:
         fields["assignee"] = {"id": state.jira_account_id}
 
     try:
+        jira_endpoint = f"{JIRA_BASE_URL}/rest/api/3/issue"
+        safe_summary = (summary[:120] + "...") if len(summary) > 120 else summary
+        logger.info(
+            "Jira create request: endpoint=%s project=%s issue_type=%s assignee_id=%s summary=%s",
+            jira_endpoint,
+            JIRA_PROJECT_KEY,
+            JIRA_ISSUE_TYPE,
+            state.jira_account_id or "none",
+            safe_summary,
+        )
+
         resp = requests.post(
-            f"{JIRA_BASE_URL}/rest/api/3/issue",
+            jira_endpoint,
             data=json.dumps({"fields": fields}),
             headers={"Accept": "application/json", "Content-Type": "application/json"},
             auth=HTTPBasicAuth(JIRA_EMAIL, JIRA_API_TOKEN),
+            timeout=30,
         )
-        result = resp.json()
+        logger.info("Jira create response status=%s", resp.status_code)
+        try:
+            result = resp.json()
+        except ValueError:
+            result = {"raw_body": resp.text}
+
+        logger.info("Jira create response body=%s", json.dumps(result, ensure_ascii=True))
+
+        if not resp.ok:
+            error_messages = result.get("errorMessages", []) if isinstance(result, dict) else []
+            error_fields = result.get("errors", {}) if isinstance(result, dict) else {}
+            logger.error(
+                "Jira create failed: status=%s errorMessages=%s errors=%s",
+                resp.status_code,
+                error_messages,
+                error_fields,
+            )
+            if any("permission" in msg.lower() for msg in error_messages if isinstance(msg, str)):
+                logger.error(
+                    "Jira permission issue detected for project=%s user=%s",
+                    JIRA_PROJECT_KEY,
+                    JIRA_EMAIL,
+                )
+
         if "key" in result:
             return state.model_copy(update={"jira_key": result["key"]})
-        return state.model_copy(update={"error": json.dumps(result)})
+        return state.model_copy(update={"error": json.dumps({"status": resp.status_code, "body": result})})
     except Exception as e:
+        logger.exception("Jira create exception")
         return state.model_copy(update={"error": str(e)})
 
 
 def slack_post_result(state: OrchestratorState) -> OrchestratorState:
     """Update the Slack preview message with the final outcome."""
-    client = WebClient(token=SLACK_BOT_TOKEN)
+    client = _logged_slack(WebClient(token=SLACK_BOT_TOKEN))
     msg = (
         f"✅ *Ticket Created:* <{JIRA_BASE_URL}/browse/{state.jira_key}|{state.jira_key}>"
         if state.jira_key
@@ -176,7 +236,7 @@ def slack_post_result(state: OrchestratorState) -> OrchestratorState:
 
 def slack_post_cancel(state: OrchestratorState) -> OrchestratorState:
     """Update the Slack message to show cancellation."""
-    client = WebClient(token=SLACK_BOT_TOKEN)
+    client = _logged_slack(WebClient(token=SLACK_BOT_TOKEN))
     try:
         client.chat_update(
             channel=state.channel_id,
