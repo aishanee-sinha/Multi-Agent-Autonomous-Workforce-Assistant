@@ -133,7 +133,7 @@ def email_classify(state: OrchestratorState) -> OrchestratorState:
             "meeting_start":     data.get("start_time"),
             "meeting_end":       data.get("end_time"),
             "meeting_location":  data.get("location"),
-            "meeting_attendees": data.get("attendees", []),
+            "meeting_attendees": data.get("attendees") or [],
             "time_confidence":   data.get("time_confidence", "none"),
         })
     except Exception as e:

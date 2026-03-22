@@ -29,7 +29,7 @@ Chain-of-Debate (router only):
   model directly via the REST API so no EC2 instance is involved.
 """
 
-import base64, json, logging, os, urllib.parse, urllib.request
+import base64, json, logging, os, urllib.error, urllib.parse, urllib.request
 from typing import Literal
 from uuid import uuid4
 
@@ -85,46 +85,92 @@ class RouterDecision(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 # Chain-of-Debate helpers
 # ─────────────────────────────────────────────────────────────────────────────
-_DEBATE_MODEL   = "claude-sonnet-4-20250514"
-_ANTHROPIC_URL  = "https://api.anthropic.com/v1/messages"
-_ANTHROPIC_VER  = "2023-06-01"
+_DEBATE_MODEL   = "gpt-5-nano-2025-08-07"
+_OPENAI_URL     = "https://api.openai.com/v1/responses"
 _VALID_INTENTS  = {"slack", "email", "none"}
 
 
-def _anthropic_chat(system: str, user: str, max_tokens: int = 512) -> str:
+def _openai_chat(system: str, user: str, max_tokens: int = 512) -> str:
     """
-    Thin wrapper around the Anthropic /v1/messages REST endpoint.
-    Reads ANTHROPIC_API_KEY from the environment (same Lambda env-var set).
-    Does NOT touch the EC2 instance — pure HTTPS to api.anthropic.com.
+    Thin wrapper around the OpenAI /v1/responses REST endpoint.
+    Reads OPENAI_API_KEY from the environment (same Lambda env-var set).
+    Does NOT touch the EC2 instance — pure HTTPS to api.openai.com.
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    api_key = os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY env var is not set")
+        raise RuntimeError("OPENAI_API_KEY env var is not set")
 
-    payload = json.dumps({
-        "model":      _DEBATE_MODEL,
-        "max_tokens": max_tokens,
-        "system":     system,
-        "messages":   [{"role": "user", "content": user}],
-    }).encode("utf-8")
+    def _request(output_tokens: int) -> dict:
+        payload = json.dumps({
+            "model": _DEBATE_MODEL,
+            "max_output_tokens": output_tokens,
+            "reasoning": {"effort": "minimal"},
+            "text": {"verbosity": "low"},
+            "input": [
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": system}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": user}],
+                },
+            ],
+        }).encode("utf-8")
 
-    req = urllib.request.Request(
-        _ANTHROPIC_URL,
-        data=payload,
-        headers={
-            "content-type":      "application/json",
-            "x-api-key":         api_key,
-            "anthropic-version": _ANTHROPIC_VER,
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
+        req = urllib.request.Request(
+            _OPENAI_URL,
+            data=payload,
+            headers={
+                "content-type":  "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"OpenAI Responses API error HTTP {e.code}: {detail}") from e
 
-    # content is a list of blocks; grab the first text block
-    for block in body.get("content", []):
-        if block.get("type") == "text":
-            return block["text"].strip()
+    def _extract_text(body: dict) -> str:
+        output_text = body.get("output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
+
+        for item in body.get("output", []):
+            for block in item.get("content", []):
+                if block.get("type") in ("output_text", "text"):
+                    text = block.get("text", "")
+                    if isinstance(text, str) and text.strip():
+                        return text.strip()
+        return ""
+
+    body = _request(max_tokens)
+    text = _extract_text(body)
+    if text:
+        return text
+
+    incomplete_reason = (body.get("incomplete_details") or {}).get("reason")
+    if incomplete_reason == "max_output_tokens":
+        retry_tokens = max(max_tokens * 2, 1024)
+        logger.warning(
+            "OpenAI Responses incomplete due to max_output_tokens=%s; retrying with %s",
+            max_tokens,
+            retry_tokens,
+        )
+        retry_body = _request(retry_tokens)
+        retry_text = _extract_text(retry_body)
+        if retry_text:
+            return retry_text
+        logger.warning(
+            "OpenAI Responses retry returned no extractable text. Raw body=%s",
+            json.dumps(retry_body, ensure_ascii=True),
+        )
+        return ""
+
+    logger.warning("OpenAI Responses returned no extractable text. Raw body=%s", json.dumps(body, ensure_ascii=True))
     return ""
 
 
@@ -199,7 +245,7 @@ def chain_of_debate(state: OrchestratorState) -> OrchestratorState:
     )
 
     try:
-        proposer_arg = _anthropic_chat(proposer_sys, proposer_user)
+        proposer_arg = _openai_chat(proposer_sys, proposer_user)
         logger.info("[trace=%s] chain_of_debate proposer: %s", trace_id, proposer_arg[:120])
     except Exception as e:
         logger.error("[trace=%s] chain_of_debate proposer error: %s", trace_id, e)
@@ -223,7 +269,7 @@ def chain_of_debate(state: OrchestratorState) -> OrchestratorState:
     )
 
     try:
-        challenger_arg = _anthropic_chat(challenger_sys, challenger_user)
+        challenger_arg = _openai_chat(challenger_sys, challenger_user)
         logger.info("[trace=%s] chain_of_debate challenger: %s", trace_id, challenger_arg[:120])
     except Exception as e:
         logger.error("[trace=%s] chain_of_debate challenger error: %s", trace_id, e)
@@ -248,7 +294,7 @@ def chain_of_debate(state: OrchestratorState) -> OrchestratorState:
     )
 
     try:
-        judge_raw = _anthropic_chat(judge_sys, judge_user, max_tokens=256)
+        judge_raw = _openai_chat(judge_sys, judge_user, max_tokens=256)
         logger.info("[trace=%s] chain_of_debate judge raw: %s", trace_id, judge_raw[:200])
 
         # Strip optional markdown fences before parsing
@@ -512,14 +558,6 @@ def handler(event: dict, context) -> dict:
     import os
     trace_id = _trace_id_from_event(event)
     logger.info("[trace=%s] handler start", trace_id)
-    logger.info("=== ALL ENV VARS ===")
-    for key in ["SLACK_NOTIFY_CHANNEL", "SLACK_BOT_TOKEN", "EC2_IP",
-                "GOOGLE_TOKEN_JSON", "GROUP_EMAILS_JSON", "JIRA_BASE_URL",
-                "ANTHROPIC_API_KEY"]:   # ← added for chain_of_debate
-        val = os.environ.get(key, "NOT SET")
-        # Don't log full secrets — just first 10 chars
-        safe = val[:10] + "..." if len(val) > 10 else val
-        logger.info("[trace=%s] env %s=%s", trace_id, key, safe)
     logger.info("[trace=%s] event=%s", trace_id, json.dumps(event))
     initial = OrchestratorState(raw_event=event)
     config  = {"configurable": {"thread_id": trace_id}}
