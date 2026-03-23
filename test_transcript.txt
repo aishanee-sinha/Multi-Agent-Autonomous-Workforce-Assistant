@@ -1,0 +1,49 @@
+MEETING TRANSCRIPT
+Project: DATA-298B Meeting Summarizer - Phase 4 Review
+Date: March 21, 2026
+Participants: Utkarsh (Project Lead), Aishanee (Backend), Ketki (Infrastructure), Ravi (Evaluation)
+
+---
+
+[00:00] Utkarsh: Alright everyone, let's get started. Today we are reviewing Phase 4 results and planning our cloud deployment. Aishanee, can you start with a quick recap of what we trained?
+
+[00:42] Aishanee: Sure. So we fine-tuned Qwen 2.5 14B Instruct using QLoRA with LoRA rank 64. The training ran for about 20 hours on the 4090. We used an expanded dataset combining AMI corpus, MeetingBank with about 4700 records, and QMSum with 232 records. Total training samples after chunking were around 32,000.
+
+[01:15] Utkarsh: Good. Ketki, how are we on the infrastructure side?
+
+[01:22] Ketki: So the model adapter files are already uploaded to S3 in the qwen-lora-weights bucket under transcript-summarizer prefix. I set up the EC2 instance as a g4dn.2xlarge. The vLLM server should be ready to deploy. Main thing pending is the Lambda function and the API Gateway setup.
+
+[01:55] Utkarsh: Okay, so we need to get the Lambda deployed by end of this week. Ketki, can you take ownership of the EC2 and vLLM setup?
+
+[02:10] Ketki: Yes, I can have the EC2 ready by Wednesday.
+
+[02:18] Ravi: I wanted to flag one issue. During our evaluation run on Colab, we hit a numpy binary incompatibility error. We fixed it by forcing numpy 1.26.4 but we should document that in the setup guide.
+
+[02:40] Aishanee: Agreed. Also, the base model download takes around 30 minutes on first boot, so we should make sure the EC2 startup script handles that gracefully with a health check.
+
+[02:58] Utkarsh: Good point. Ravi, can you write up the evaluation results summary and have it ready for the weekly report? We need ROUGE scores, G-Eval numbers, and the comparison between base and fine-tuned.
+
+[03:20] Ravi: Sure, I will prepare a two-page evaluation summary. I can have a draft by Thursday.
+
+[03:30] Ketki: One more thing - for the Slack integration, should we post to the general project channel or create a dedicated meeting-summaries channel?
+
+[03:42] Utkarsh: Let's create a dedicated channel. That way it's cleaner and we can add all team members to it. Aishanee, can you create a Slack channel called meeting-summaries and add the bot?
+
+[03:58] Aishanee: Will do. I will also set up the Google Apps Script trigger to monitor the transcript folder. Should be done by Tuesday.
+
+[04:15] Utkarsh: Perfect. So to recap: Ketki is on EC2 and vLLM by Wednesday, Aishanee is on Slack channel setup and Google Apps Script by Tuesday, and Ravi has the evaluation report by Thursday. I will take care of the Lambda deployment and API Gateway configuration by Friday.
+
+[04:40] Ravi: Quick question - are we using SES for the email or should we consider SendGrid?
+
+[04:50] Utkarsh: Let's stick with SES since we are already on AWS. It is free up to 62,000 emails per month in the first year.
+
+[05:02] Aishanee: Also, we should verify our project emails in SES before the Lambda can send. Utkarsh, can you do that as part of the Lambda setup?
+
+[05:15] Utkarsh: Yes I will handle that. Anything else before we close?
+
+[05:20] Ketki: We should also decide on a meeting date to do an end-to-end demo once everything is deployed.
+
+[05:30] Utkarsh: Let's target March 28th for the end-to-end demo. I will send a calendar invite. That is everything for today. Thanks everyone.
+
+---
+END OF TRANSCRIPT

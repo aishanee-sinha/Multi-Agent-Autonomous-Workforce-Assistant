@@ -1,0 +1,9 @@
+# requirements.txt
+# Lambda function dependencies for Meeting Summarizer Agent
+# Python 3.11 runtime
+
+requests==2.31.0
+slack-sdk==3.27.1
+google-auth==2.29.0
+google-api-python-client==2.131.0
+boto3==1.34.84

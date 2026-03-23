@@ -1,0 +1,7 @@
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+*.pem
+lambda_package/
+meeting_summarizer_lambda.zip
