@@ -158,11 +158,6 @@ See `DataProcessingModelTraining/EmailCalendar/Evaluation_Email.ipynb` for the e
 - `DataProcessingModelTraining/MeetingSummarizer/README.md` — summarizer training/eval notes
 - `DataProcessingModelTraining/Slack_Jira/readme.md` — Slack/Jira labeling + training
 
-## Security
-
-- Do not commit secrets (Slack tokens, Jira tokens, OAuth tokens).
-- Prefer Lambda environment variables and Colab Secrets.
-- Treat `GOOGLE_TOKEN_JSON` as a secret (it contains refresh credentials).
 
 ## License
 
