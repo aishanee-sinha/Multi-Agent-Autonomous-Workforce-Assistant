@@ -1,0 +1,312 @@
+"""
+orchestrator.py — Top-level graph + Lambda entry point
+=======================================================
+Architecture:
+  Lambda handler → parse_input → router_agent (Qwen LLM)
+                                      │
+                      ┌───────────────┴────────────────┐
+                      ▼                                 ▼
+              [SLACK SUBGRAPH]               [CALENDAR SUBGRAPH]
+         Jira ticket creation             Autonomous email → meeting
+
+Autonomous email flow:
+  1. Gmail receives email → pushes to Pub/Sub → triggers Lambda
+  2. parse_input detects pubsub format → intent=email
+  3. calendar agent classifies with Qwen → posts Slack card
+  4. User clicks ✅ Create Meeting → Slack sends interactivity to Lambda
+  5. parse_input detects create_meeting action → intent=email
+  6. calendar agent creates Google Calendar event
+"""
+
+import base64, json, logging, urllib.parse
+from typing import Literal
+from uuid import uuid4
+
+from pydantic import BaseModel, Field
+from langchain_core.messages import SystemMessage, HumanMessage
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
+
+from state import OrchestratorState, _llm
+from slack_agent import build_slack_subgraph
+from calendar_agent import build_calendar_subgraph
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+
+def _trace_id_from_event(event: dict) -> str:
+    """Build a stable trace id for one invocation so logs can be correlated."""
+    headers = {k.lower(): v for k, v in (event.get("headers", {}) or {}).items()}
+    candidates = [
+        headers.get("x-amzn-trace-id"),
+        headers.get("x-slack-request-id"),
+    ]
+    body = event.get("body")
+    if isinstance(body, str) and body:
+        try:
+            parsed = json.loads(body)
+            evt = parsed.get("event", {}) if isinstance(parsed, dict) else {}
+            if isinstance(evt, dict):
+                candidates.append(evt.get("event_ts"))
+                candidates.append(evt.get("client_msg_id"))
+            candidates.append(parsed.get("event_id") if isinstance(parsed, dict) else None)
+        except Exception:
+            pass
+
+    for value in candidates:
+        if value:
+            safe = str(value).replace(" ", "_")
+            return safe[:120]
+    return str(uuid4())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Router schema
+# ─────────────────────────────────────────────────────────────────────────────
+class RouterDecision(BaseModel):
+    intent: Literal["slack", "email", "none"] = Field(
+        description="'slack' if Slack/Jira task, 'email' if meeting invite, 'none' if neither"
+    )
+    reason: str = Field(description="One-sentence explanation")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# parse_input
+# ─────────────────────────────────────────────────────────────────────────────
+def parse_input(state: OrchestratorState) -> OrchestratorState:
+    event   = state.raw_event
+    headers = {k.lower(): v for k, v in event.get("headers", {}).items()}
+    trace_id = _trace_id_from_event(event)
+    logger.info("[trace=%s] parse_input start", trace_id)
+
+    # ── Slack retry guard ───────────────────────────────────────────────────
+    if int(headers.get("x-slack-retry-num", 0)) > 0:
+        logger.info("[trace=%s] parse_input retry ignored: retry_num=%s", trace_id, headers.get("x-slack-retry-num"))
+        return state.model_copy(update={"intent": "none", "is_retry": True})
+
+    body_raw = event.get("body", "")
+    if event.get("isBase64Encoded"):
+        body_raw = base64.b64decode(body_raw).decode("utf-8")
+
+    # ── Slack interactivity (button press) ──────────────────────────────────
+    if body_raw.startswith("payload="):
+        payload_str = urllib.parse.unquote_plus(body_raw.split("payload=")[1])
+        payload     = json.loads(payload_str)
+        action      = payload["actions"][0]
+        action_id   = action["action_id"]
+        logger.info("[trace=%s] parse_input interactivity action_id=%s", trace_id, action_id)
+        raw_value   = urllib.parse.unquote_plus(action.get("value", "{}"))
+        value_dict  = json.loads(raw_value) if raw_value and raw_value != "{}" else {}
+
+        # ── Calendar meeting buttons ────────────────────────────────────────
+        if action_id in ("create_meeting", "cancel_meeting"):
+            return state.model_copy(update={
+                "intent":             "email",
+                "slack_event_type":   "interactivity",
+                "slack_action_id":    action_id,
+                "pending_meeting":    value_dict if action_id == "create_meeting" else None,
+                "channel_id":         payload["channel"]["id"],
+                "preview_ts":         payload["container"]["message_ts"],
+            })
+
+        # ── Jira ticket buttons ─────────────────────────────────────────────
+        return state.model_copy(update={
+            "intent":             "slack",
+            "slack_event_type":   "interactivity",
+            "slack_action_id":    action_id,
+            "slack_action_value": value_dict,
+            "channel_id":         payload["channel"]["id"],
+            "preview_ts":         payload["container"]["message_ts"],
+        })
+
+    body_str = body_raw.strip()
+    if not body_str:
+        logger.info("[trace=%s] parse_input empty body", trace_id)
+        return state.model_copy(update={"intent": "none"})
+
+    try:
+        body = json.loads(body_str)
+    except json.JSONDecodeError:
+        logger.warning("[trace=%s] parse_input body is not valid JSON", trace_id)
+        return state.model_copy(update={"intent": "none", "error": "Unparseable body"})
+
+    # ── Slack URL verification ───────────────────────────────────────────────
+    if body.get("type") == "url_verification":
+        logger.info("[trace=%s] parse_input url_verification", trace_id)
+        return state.model_copy(update={"intent": "slack", "slack_event_type": "url_verification"})
+
+    # ── Gmail Pub/Sub push — autonomous email trigger ────────────────────────
+    if body.get("message", {}).get("data"):
+        try:
+            decoded = json.loads(base64.b64decode(body["message"]["data"]).decode("utf-8"))
+            if "emailAddress" in decoded:
+                logger.info("[trace=%s] parse_input pubsub email trigger detected", trace_id)
+                return state.model_copy(update={
+                    "intent":       "email",
+                    "email_source": "pubsub",
+                    "email_data":   body,
+                })
+        except Exception:
+            pass
+
+    # ── Slack message event ──────────────────────────────────────────────────
+    if "event" in body:
+        slack_event = body["event"]
+        is_bot      = bool(slack_event.get("bot_id") or slack_event.get("subtype") == "bot_message")
+        clean_text  = slack_event.get("text", "").replace("<@", "").replace(">", "")
+        logger.info(
+            "[trace=%s] parse_input slack message event: is_bot=%s channel=%s",
+            trace_id,
+            is_bot,
+            slack_event.get("channel"),
+        )
+        return state.model_copy(update={
+            "intent":           "unknown",
+            "slack_event_type": "message",
+            "is_bot":           is_bot,
+            "channel_id":       slack_event.get("channel"),
+            "user_text":        clean_text,
+            "message_ts":       slack_event.get("ts"),
+        })
+
+    # ── Plain email dict (direct / test invocation) ──────────────────────────
+    if "from_email" in body or "subject" in body:
+        logger.info("[trace=%s] parse_input direct email payload", trace_id)
+        return state.model_copy(update={
+            "intent":       "email",
+            "email_source": "direct",
+            "email_data":   body,
+        })
+
+    logger.info("[trace=%s] parse_input fell through to unknown intent", trace_id)
+    return state.model_copy(update={"intent": "unknown"})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# router_agent
+# ─────────────────────────────────────────────────────────────────────────────
+def router_agent(state: OrchestratorState) -> OrchestratorState:
+    """
+    Only called when intent is still 'unknown' (Slack message events).
+    All other intents are set definitively by parse_input.
+    """
+    trace_id = _trace_id_from_event(state.raw_event)
+    if state.intent in ("slack", "email", "none"):
+        logger.info("[trace=%s] router skipped with pre-set intent=%s", trace_id, state.intent)
+        return state
+
+    if state.is_bot:
+        logger.info("[trace=%s] router ignored bot message", trace_id)
+        return state.model_copy(update={"intent": "none"})
+
+    context_parts = []
+    if state.user_text:
+        context_parts.append(f"Slack message: \"{state.user_text}\"")
+    if state.email_data:
+        ed = state.email_data
+        context_parts.append(
+            f"Email from {ed.get('from_email', '')} "
+            f"subject: \"{ed.get('subject', '')}\" "
+            f"body: \"{ed.get('snippet', ed.get('body', ''))[:300]}\""
+        )
+
+    if not context_parts:
+        logger.info("[trace=%s] router found no actionable context", trace_id)
+        return state.model_copy(update={"intent": "none"})
+
+    sys_msg = (
+        "You are an intent router for a workplace automation system.\n"
+        "  'slack'  — Slack message asking to create a Jira task\n"
+        "  'email'  — email containing meeting scheduling intent\n"
+        "  'none'   — not actionable\n"
+        "Return a RouterDecision JSON."
+    )
+
+    llm = _llm(structured_output=RouterDecision)
+    try:
+        decision: RouterDecision = llm.invoke(
+            [SystemMessage(content=sys_msg), HumanMessage(content="\n".join(context_parts))]
+        )
+        logger.info("[trace=%s] router decision: intent=%s reason=%s", trace_id, decision.intent, decision.reason)
+        return state.model_copy(update={"intent": decision.intent, "intent_reason": decision.reason})
+    except Exception as e:
+        logger.error("[trace=%s] router LLM error: %s", trace_id, e)
+        return state.model_copy(update={"intent": "none", "error": str(e)})
+
+
+def route_to_agent(state: OrchestratorState) -> Literal["slack_subgraph", "calendar_subgraph", "__end__"]:
+    trace_id = _trace_id_from_event(state.raw_event)
+    if state.intent == "slack":
+        logger.info("[trace=%s] route_to_agent -> slack_subgraph", trace_id)
+        return "slack_subgraph"
+    if state.intent == "email":
+        logger.info("[trace=%s] route_to_agent -> calendar_subgraph", trace_id)
+        return "calendar_subgraph"
+    logger.info("[trace=%s] route_to_agent -> end", trace_id)
+    return "__end__"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Graph assembly
+# ─────────────────────────────────────────────────────────────────────────────
+def build_orchestrator(checkpointer=None) -> StateGraph:
+    slack_sg    = build_slack_subgraph()
+    calendar_sg = build_calendar_subgraph()
+
+    b = StateGraph(OrchestratorState)
+    b.add_node("parse_input",       parse_input)
+    b.add_node("router_agent",      router_agent)
+    b.add_node("slack_subgraph",    slack_sg)
+    b.add_node("calendar_subgraph", calendar_sg)
+
+    b.add_edge(START, "parse_input")
+    b.add_edge("parse_input", "router_agent")
+    b.add_conditional_edges("router_agent", route_to_agent, {
+        "slack_subgraph":    "slack_subgraph",
+        "calendar_subgraph": "calendar_subgraph",
+        "__end__":           END,
+    })
+    b.add_edge("slack_subgraph",    END)
+    b.add_edge("calendar_subgraph", END)
+
+    return b.compile(checkpointer=checkpointer)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lambda entry point
+# ─────────────────────────────────────────────────────────────────────────────
+_checkpointer = MemorySaver()
+_graph        = build_orchestrator(checkpointer=_checkpointer)
+
+def handler(event: dict, context) -> dict:
+    import os
+    trace_id = _trace_id_from_event(event)
+    logger.info("[trace=%s] handler start", trace_id)
+    logger.info("=== ALL ENV VARS ===")
+    for key in ["SLACK_NOTIFY_CHANNEL", "SLACK_BOT_TOKEN", "EC2_IP", 
+                "GOOGLE_TOKEN_JSON", "GROUP_EMAILS_JSON", "JIRA_BASE_URL"]:
+        val = os.environ.get(key, "NOT SET")
+        # Don't log full secrets — just first 10 chars
+        safe = val[:10] + "..." if len(val) > 10 else val
+        logger.info("[trace=%s] env %s=%s", trace_id, key, safe)
+    logger.info("[trace=%s] event=%s", trace_id, json.dumps(event))
+    initial = OrchestratorState(raw_event=event)
+    config  = {"configurable": {"thread_id": trace_id}}
+    logger.info("[trace=%s] graph invoke thread_id=%s", trace_id, trace_id)
+
+    try:
+        result = _graph.invoke(initial, config=config)
+        final  = OrchestratorState(**result) if isinstance(result, dict) else result
+    except Exception as e:
+        logger.error("[trace=%s] graph error: %s", trace_id, e, exc_info=True)
+        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
+
+    # Slack URL verification
+    if final.slack_event_type == "url_verification":
+        logger.info("[trace=%s] handler returning Slack URL verification response", trace_id)
+        body = json.loads(event.get("body", "{}"))
+        return {"statusCode": 200, "body": json.dumps({"challenge": body.get("challenge")})}
+
+    logger.info("[trace=%s] handler complete status=200", trace_id)
+    return {"statusCode": 200, "body": "ok"}
