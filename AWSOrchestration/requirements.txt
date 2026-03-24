@@ -1,0 +1,21 @@
+# Core graph + LLM client
+langgraph>=0.2.0
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+pydantic>=2.0.0
+
+# Slack + HTTP
+slack-sdk>=3.21.0
+requests>=2.31.0
+
+# Google APIs (Gmail watcher + Calendar)
+google-api-python-client>=2.0.0
+google-auth>=2.0.0
+google-auth-httplib2>=0.1.0
+
+# Local env loading for helper scripts
+python-dotenv>=1.0.0
+
+# Often required by LLM stacks for tokenization
+# (Dockerfile installs Rust to support building wheels when needed)
+tiktoken>=0.6.0
