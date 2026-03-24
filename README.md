@@ -43,3 +43,101 @@ new_key = create_issue(slack_msg)
 print("Created:", new_key)
 ```
 
+## Getting started
+
+### Option A — Orchestration (AWS Lambda + EC2 vLLM)
+
+This path is for running the production system.
+
+1. **Start the vLLM server** (typically on a GPU EC2 instance) with your base model + LoRA adapters.
+    - The canonical command and adapter naming conventions are documented in `AWSOrchestration/Readme.MD` and `AWSOrchestration/Runbook.md`.
+
+2. **Build and deploy the Lambda container image**:
+    ```bash
+    cd AWSOrchestration
+    docker build -t slack-jira-agent .
+    ```
+    Then push to ECR and update the Lambda image (see `AWSOrchestration/Readme.MD`).
+
+3. **Configure Slack**:
+    - Set the Lambda function URL / API Gateway endpoint as Slack’s Request URL.
+    - Enable **Event Subscriptions** and **Interactivity**.
+
+4. **Configure Gmail → Pub/Sub → Lambda**:
+    - Create a Pub/Sub topic, connect it to Gmail watch, and route pushes to your Lambda.
+    - You can register the Gmail watch with:
+      ```bash
+      cd AWSOrchestration
+      python gmail_watcher.py
+      ```
+      (requires `GOOGLE_TOKEN_JSON` and `PUBSUB_TOPIC` env vars).
+
+### Option B — Notebooks (data labeling → fine-tuning → evaluation)
+
+This path is for reproducing training/evaluation runs (commonly in Google Colab).
+
+**Email → Calendar meeting extraction pipeline** (recommended order):
+1. `DataProcessingModelTraining/EmailCalendar/DataLabelling_Email.ipynb`
+2. `DataProcessingModelTraining/EmailCalendar/DataPreprocessing_Email.ipynb`
+3. `DataProcessingModelTraining/EmailCalendar/Finetuning_Email.ipynb`
+4. `DataProcessingModelTraining/EmailCalendar/Evaluation_Email.ipynb`
+
+Other tracks:
+- Meeting summarization: `DataProcessingModelTraining/MeetingSummarizer/README.md`
+- Slack → Jira extraction: `DataProcessingModelTraining/Slack_Jira/readme.md`
+
+## Configuration
+
+### Orchestration environment variables (Lambda)
+
+These are read in `AWSOrchestration/state.py` and used by `orchestrator.py`, `slack_agent.py`, and `calendar_agent.py`.
+
+| Variable | Required | Purpose |
+|---|---:|---|
+| `EC2_IP` | Yes | Public IP/host of the vLLM server (expects OpenAI-compatible `/v1` endpoints) |
+| `SLACK_BOT_TOKEN` | Yes | Slack bot token (`xoxb-...`) |
+| `SLACK_NOTIFY_CHANNEL` | Yes | Channel ID where meeting proposals are posted |
+| `JIRA_BASE_URL` | Yes | Jira base URL, e.g. `https://yourorg.atlassian.net` |
+| `JIRA_EMAIL` | Yes | Jira account email used for API auth |
+| `JIRA_API_TOKEN` | Yes | Jira API token |
+| `JIRA_PROJECT_KEY` | No | Defaults to `KAN` |
+| `JIRA_ISSUE_TYPE` | No | Defaults to `Task` |
+| `GOOGLE_TOKEN_JSON` | Yes | Serialized Google OAuth token JSON (used for Gmail fetch + Calendar) |
+| `GROUP_EMAILS_JSON` | No | JSON array allowlist of sender emails for calendar flow |
+| `TEAM_MAP_JSON` | No | JSON map: Slack name/id → Jira account id |
+
+### Helper-script environment variables (local / ops)
+
+| Variable | Required | Used by |
+|---|---:|---|
+| `PUBSUB_TOPIC` | Yes (for watch) | `AWSOrchestration/gmail_watcher.py` |
+
+### Notebook secrets (training)
+
+The notebooks generally assume execution in Colab and may use:
+
+- `GEMINI_API_KEY` (for automated labeling)
+- `HF_TOKEN` (for pulling gated models/checkpoints)
+
+## Evaluation notes
+
+Evaluation for meeting extraction includes:
+
+- **JSON validity** (parseable structured output)
+- **Meeting detection** confusion matrix (precision/recall/F1)
+- **Field-level extraction** accuracy (title, attendees, start/end time, location, time_confidence)
+
+See `DataProcessingModelTraining/EmailCalendar/Evaluation_Email.ipynb` for the exact metrics code and reporting.
+
+## Docs
+
+- `AWSOrchestration/Readme.MD` — architecture + deployment details
+- `AWSOrchestration/Runbook.md` — operational commands and troubleshooting
+- `AWSOrchestration/Meeting_Summarizer/README.md` — meeting summarizer tooling
+- `DataProcessingModelTraining/MeetingSummarizer/README.md` — summarizer training/eval notes
+- `DataProcessingModelTraining/Slack_Jira/readme.md` — Slack/Jira labeling + training
+
+
+## License
+
+No license is currently specified in this repository.
