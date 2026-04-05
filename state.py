@@ -29,6 +29,12 @@ TEAM_MAP: dict   = json.loads(os.environ.get("TEAM_MAP_JSON", "{}"))
 GROUP_EMAILS = json.loads(os.environ.get("GROUP_EMAILS_JSON", "[]"))
 GOOGLE_TOKEN = os.environ.get("GOOGLE_TOKEN_JSON", "")
 
+# Maps email address → token filename stem
+# e.g. {"msadi.finalproject@gmail.com": "Agent", "aishanee.sinha@sjsu.edu": "Aishanee"}
+# Maps email address → refresh_token string
+# e.g. {"aishanee.sinha@sjsu.edu": "1//0abc...", "sohan.juetce@gmail.com": "1//0def..."}
+CALENDAR_TOKENS: dict = json.loads(os.environ.get("CALENDAR_TOKENS_JSON", "{}"))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared LLM factory
