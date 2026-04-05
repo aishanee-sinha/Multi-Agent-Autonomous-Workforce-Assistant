@@ -18,6 +18,7 @@ python-dateutil
 
 # Data validation
 pydantic
+email-validator
 
 # Environment (local only — not needed in Lambda but harmless)
 python-dotenv
