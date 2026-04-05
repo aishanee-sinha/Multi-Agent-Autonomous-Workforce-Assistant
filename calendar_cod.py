@@ -52,7 +52,7 @@ from calendar_agent import (
 )
 from orchestrator import parse_input, router_agent, route_to_agent
 from slack_agent import build_slack_subgraph
-from state import OrchestratorState, _llm
+from state import OrchestratorState, _llm, CALENDAR_TOKENS
 
 logger = logging.getLogger(__name__)
 
@@ -186,21 +186,21 @@ def _get_events_with_titles(access_token: str, time_min: str, time_max: str) -> 
 
 def _load_participant_tokens() -> dict[str, str]:
     """
-    Scans current directory for tokens_*.json, refreshes each.
-    Returns {name: access_token}.
+    Loads participant tokens from CALENDAR_TOKENS_JSON env var (email → refresh_token).
+    Returns {email: access_token}.
     """
+    if not CALENDAR_TOKENS:
+        logger.warning("slot_cod: CALENDAR_TOKENS_JSON not set — no calendars to fetch")
+        return {}
+
     participants: dict[str, str] = {}
-    for fname in os.listdir("."):
-        if not (fname.startswith("tokens_") and fname.endswith(".json")):
-            continue
-        name = fname[len("tokens_"):-len(".json")]
+    for email, refresh_tok in CALENDAR_TOKENS.items():
         try:
-            with open(fname) as f:
-                tokens = json.load(f)
-            participants[name] = _refresh_token(tokens["refresh_token"])
-            logger.info("slot_cod: loaded token for %s", name)
+            participants[email] = _refresh_token(refresh_tok)
+            logger.info("slot_cod: loaded token for %s", email)
         except Exception as e:
-            logger.warning("slot_cod: failed to load token for %s: %s", name, e)
+            logger.warning("slot_cod: failed to refresh token for %s: %s", email, e)
+
     return participants
 
 
@@ -575,7 +575,7 @@ def slot_cod(state: OrchestratorState) -> OrchestratorState:
     # 2. Load participant tokens
     access_tokens = _load_participant_tokens()
     if not access_tokens:
-        logger.warning("slot_cod: no token files found — clearing email-extracted time, CoD required")
+        logger.warning("slot_cod: no tokens loaded — clearing email-extracted time, CoD required")
         return state.model_copy(update={"meeting_start": None, "meeting_end": None})
 
     # 3. Fetch events for the FULL search window in one API call per participant.
