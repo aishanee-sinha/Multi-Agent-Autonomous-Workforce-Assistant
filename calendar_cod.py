@@ -562,6 +562,19 @@ def slot_cod(state: OrchestratorState) -> OrchestratorState:
     if not state.is_meeting:
         return state
 
+    email = state.email_data or {}
+    logger.info("=" * 60)
+    logger.info("STARTING COD — EMAIL CONTEXT")
+    logger.info(f"  subject   : {email.get('subject')}")
+    logger.info(f"  from      : {email.get('from_email')}")
+    logger.info(f"  is_meeting: {state.is_meeting}")
+    logger.info(f"  title     : {state.meeting_title}")
+    logger.info(f"  confidence: {state.time_confidence}")
+    logger.info(f"  start_win : {state.meeting_start}")
+    logger.info(f"  end_win   : {state.meeting_end}")
+    logger.info(f"  body      :\n{email.get('body', '(empty)')[:500]}")
+    logger.info("=" * 60)
+
     # Capture the full email_classify output as context for CoD BEFORE any state changes.
     # The search window (meeting_start/end) is used as a hint to pick days to scan;
     # the CoD judge sets the final meeting_start/end — email values do not leak through.

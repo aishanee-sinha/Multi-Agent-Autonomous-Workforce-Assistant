@@ -200,17 +200,8 @@ def email_fetch_and_parse(state: OrchestratorState) -> OrchestratorState:
         logger.info(f"email_fetch_and_parse: fetched {len(emails)} email(s)")
         if emails:
             e = emails[0]
-            logger.info("=" * 60)
-            logger.info("EMAIL FETCHED — BEFORE COD")
-            logger.info(f"  historyId : {history_id}")
-            logger.info(f"  message_id: {e.get('message_id')}")
-            logger.info(f"  from      : {e.get('from_email')}")
-            logger.info(f"  to        : {e.get('to_emails')}")
-            logger.info(f"  subject   : {e.get('subject')}")
-            logger.info(f"  body      :\n{e.get('body', '(empty)')[:500]}")
-            logger.info("=" * 60)
-            _mark_as_read(e.get("message_id"))
-            return state.model_copy(update={"email_data": e})
+            logger.info(f"email_fetch_and_parse: from={e.get('from_email')} subject={e.get('subject')!r} body_len={len(e.get('body', ''))}")
+            return state.model_copy(update={"email_data": emails[0]})
         logger.warning("email_fetch_and_parse: no emails returned for historyId — stopping")
         return state.model_copy(update={"intent": "none", "email_data": None})
     except Exception as e:
@@ -476,58 +467,22 @@ def _fetch_new_emails(history_id: str) -> list[dict]:
         from googleapiclient.discovery import build
         creds   = _get_google_creds()
         service = build("gmail", "v1", credentials=creds)
-
-        # Try history API first
         history = service.users().history().list(
             userId="me", startHistoryId=history_id, historyTypes=["messageAdded"],
             labelId="INBOX"
         ).execute()
-        records = history.get("history", [])
-        logger.info(f"_fetch_new_emails: historyId={history_id} history_records={len(records)}")
-
+        logger.info(f"_fetch_new_emails: historyId={history_id} history_records={len(history.get('history', []))}")
         emails = []
-        for record in records:
+        for record in history.get("history", []):
             for msg_added in record.get("messagesAdded", []):
                 msg_id = msg_added["message"]["id"]
                 logger.info(f"_fetch_new_emails: fetching message id={msg_id}")
-                msg = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+                msg    = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
                 emails.append(_parse_gmail_message(msg))
-
-        if emails:
-            return emails
-
-        # Fallback: historyId is stale — fetch the most recent unread INBOX message
-        logger.warning("_fetch_new_emails: history returned no messages — falling back to most recent unread INBOX message")
-        result = service.users().messages().list(
-            userId="me", labelIds=["INBOX", "UNREAD"], maxResults=1
-        ).execute()
-        for msg_ref in result.get("messages", []):
-            logger.info(f"_fetch_new_emails: fallback fetching message id={msg_ref['id']}")
-            msg = service.users().messages().get(userId="me", id=msg_ref["id"], format="full").execute()
-            emails.append(_parse_gmail_message(msg))
-
         return emails
-
     except Exception as e:
         logger.error(f"Gmail fetch error: {e}")
         return []
-
-
-def _mark_as_read(message_id: str):
-    """Remove UNREAD label so the fallback fetch doesn't reprocess the same email."""
-    if not message_id:
-        return
-    try:
-        from googleapiclient.discovery import build
-        creds   = _get_google_creds()
-        service = build("gmail", "v1", credentials=creds)
-        service.users().messages().modify(
-            userId="me", id=message_id,
-            body={"removeLabelIds": ["UNREAD"]}
-        ).execute()
-        logger.info(f"_mark_as_read: marked {message_id} as read")
-    except Exception as e:
-        logger.warning(f"_mark_as_read: failed for {message_id}: {e}")
 
 
 def _parse_gmail_message(msg: dict) -> dict:
