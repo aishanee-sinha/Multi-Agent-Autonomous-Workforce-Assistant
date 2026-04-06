@@ -34,6 +34,8 @@ from state import (
 )
 
 logger = logging.getLogger(__name__)
+
+PDT_TZ = timezone(timedelta(hours=-7), name="PDT")
 from functools import wraps
 import logging
 
@@ -544,14 +546,33 @@ def _extract_body(payload: dict) -> str:
 def _create_calendar_event(model_output: dict, original_email: dict) -> str:
     try:
         from googleapiclient.discovery import build
+        from googleapiclient.errors import HttpError
         from dateutil.parser import parse as dp
         creds   = _get_google_creds()
         service = build("calendar", "v3", credentials=creds)
 
-        start_iso = model_output.get("start_time")
-        end_iso   = model_output.get("end_time")
+        def _normalize_iso_dt(raw_value: str | None) -> str | None:
+            """Normalize model datetime strings to valid RFC3339 with timezone."""
+            if not raw_value:
+                return None
+            text = str(raw_value).strip()
+
+            # Fix common malformed offsets like "2026-04-09T10:00:00 00:00" -> "+00:00".
+            text = re.sub(r"([0-9])\s([+-]\d{2}:\d{2})$", r"\1\2", text)
+            text = re.sub(r"([0-9])\s(\d{2}:\d{2})$", r"\1+\2", text)
+
+            dt = dp(text)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=PDT_TZ)
+            else:
+                dt = dt.astimezone(PDT_TZ)
+            return dt.isoformat()
+
+        start_iso = _normalize_iso_dt(model_output.get("start_time"))
+        end_iso   = _normalize_iso_dt(model_output.get("end_time"))
+
         if not start_iso:
-            start_dt  = datetime.now(timezone.utc) + timedelta(days=1)
+            start_dt  = datetime.now(PDT_TZ) + timedelta(days=1)
             start_iso = start_dt.isoformat()
             end_iso   = (start_dt + timedelta(hours=1)).isoformat()
         elif not end_iso:
@@ -565,15 +586,35 @@ def _create_calendar_event(model_output: dict, original_email: dict) -> str:
             "summary":     model_output.get("title") or "Meeting",
             "location":    model_output.get("location") or "",
             "description": f"Auto-created from email. Subject: {original_email.get('subject', '')}",
-            "start":       {"dateTime": start_iso, "timeZone": "UTC"},
-            "end":         {"dateTime": end_iso,   "timeZone": "UTC"},
+            "start":       {"dateTime": start_iso},
+            "end":         {"dateTime": end_iso},
             "attendees":   attendees,
-            "sendUpdates": "all",
         }
+
+        # Log the exact request payload and query params sent to Calendar API.
+        # This is useful for diagnosing 400 Bad Request responses in Lambda logs.
+        logger.info(
+            "calendar.insert request params: calendarId=%s sendUpdates=%s",
+            "primary",
+            "all",
+        )
+        logger.info("calendar.insert request body: %s", json.dumps(event, default=str))
+
         created = service.events().insert(
-            calendarId="primary", body=event, sendNotifications=True
+            calendarId="primary", body=event, sendUpdates="all"
         ).execute()
         return created.get("htmlLink", "")
+    except HttpError as e:
+        status = getattr(getattr(e, "resp", None), "status", "unknown")
+        body = ""
+        try:
+            if getattr(e, "content", None):
+                body = e.content.decode("utf-8", errors="replace")
+        except Exception:
+            body = str(e)
+        logger.error("Calendar HttpError status=%s message=%s", status, str(e))
+        logger.error("Calendar HttpError body=%s", body)
+        return ""
     except Exception as e:
         logger.error(f"Calendar error: {e}")
         return ""
