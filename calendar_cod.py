@@ -229,6 +229,9 @@ def route_to_agent(state: OrchestratorState) -> Literal["slack_subgraph", "calen
 CLIENT_ID     = os.getenv("GOOGLE_CALENDAR_CLIENT_ID")
 CLIENT_SECRET = os.getenv("GOOGLE_CALENDAR_CLIENT_SECRET")
 MODEL         = "Qwen/Qwen2.5-14B-Instruct-AWQ"
+INCLUDE_EMAIL_SENDER = os.getenv("CALENDAR_INCLUDE_SENDER", "true").strip().lower() in {
+    "1", "true", "yes", "y", "on"
+}
 
 LOCAL_TZ = datetime.now().astimezone().tzinfo
 
@@ -354,17 +357,44 @@ def _get_events_with_titles(access_token: str, time_min: str, time_max: str) -> 
     return events
 
 
-def _load_participant_tokens() -> dict[str, str]:
+def _load_participant_tokens(state: OrchestratorState) -> dict[str, str]:
     """
-    Loads participant tokens from CALENDAR_TOKENS_JSON env var (email → refresh_token).
+    Loads participant tokens from CALENDAR_TOKENS_JSON env var (email → refresh_token),
+    but only for participants extracted from email_classify attendees. Optionally
+    includes the sender if CALENDAR_INCLUDE_SENDER=true.
+
     Returns {email: access_token}.
     """
     if not CALENDAR_TOKENS:
         logger.warning("slot_cod: CALENDAR_TOKENS_JSON not set — no calendars to fetch")
         return {}
 
+    attendees_raw = state.meeting_attendees or []
+    email_data = state.email_data or {}
+    sender_raw = email_data.get("from_email")
+
+    selected_emails: set[str] = {
+        str(a).strip().lower()
+        for a in attendees_raw
+        if isinstance(a, str) and "@" in a
+    }
+
+    if INCLUDE_EMAIL_SENDER and isinstance(sender_raw, str) and "@" in sender_raw:
+        selected_emails.add(sender_raw.strip().lower())
+
+    matched_emails = [email for email in CALENDAR_TOKENS.keys() if email.lower() in selected_emails]
+    logger.info(
+        "slot_cod: attendee-driven participant selection attendees=%s include_sender=%s matched=%s",
+        sorted(selected_emails), INCLUDE_EMAIL_SENDER, matched_emails,
+    )
+
+    if not matched_emails:
+        logger.warning("slot_cod: no attendee emails matched CALENDAR_TOKENS_JSON keys")
+        return {}
+
     participants: dict[str, str] = {}
-    for email, refresh_tok in CALENDAR_TOKENS.items():
+    for email in matched_emails:
+        refresh_tok = CALENDAR_TOKENS[email]
         try:
             participants[email] = _refresh_token(refresh_tok)
             logger.info("slot_cod: loaded token for %s", email)
@@ -756,7 +786,7 @@ def slot_cod(state: OrchestratorState) -> OrchestratorState:
                 search_label, len(search_days), start_hour, end_hour)
 
     # 2. Load participant tokens
-    access_tokens = _load_participant_tokens()
+    access_tokens = _load_participant_tokens(state)
     if not access_tokens:
         logger.warning("slot_cod: no tokens loaded — clearing email-extracted time, CoD required")
         return state.model_copy(update={"meeting_start": None, "meeting_end": None})
