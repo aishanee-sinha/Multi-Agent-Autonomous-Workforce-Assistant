@@ -185,24 +185,44 @@ class EmailMeetingDetails(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 def email_fetch_and_parse(state: OrchestratorState) -> OrchestratorState:
     """
-    For Pub/Sub events — fetch emails from Gmail using history ID.
+    For Pub/Sub events — fetch emails from Gmail using the last persisted
+    historyId from SSM (not the one in the notification, which is the
+    current state and would return nothing).
     For direct invocations — email_data is already set, skip fetch.
     """
     if state.email_source != "pubsub" or not state.email_data:
         return state
 
     try:
-        pubsub_message = state.email_data.get("message", {})
-        decoded    = json.loads(base64.b64decode(pubsub_message["data"]).decode("utf-8"))
-        history_id = str(decoded.get("historyId", ""))
-        logger.info(f"email_fetch_and_parse: historyId={history_id} emailAddress={decoded.get('emailAddress')}")
-        emails     = _fetch_new_emails(history_id)
+        from gmail_history import get_last_history_id, set_last_history_id
+
+        pubsub_message   = state.email_data.get("message", {})
+        decoded          = json.loads(base64.b64decode(pubsub_message["data"]).decode("utf-8"))
+        pubsub_history_id = str(decoded.get("historyId", ""))
+        email_address    = decoded.get("emailAddress", "")
+        logger.info(f"email_fetch_and_parse: pubsub historyId={pubsub_history_id} emailAddress={email_address}")
+
+        # Use SSM-persisted historyId as the start of the query window
+        last_history_id = get_last_history_id()
+        if not last_history_id:
+            # First run — seed with pubsub historyId minus a small offset so we
+            # catch the triggering email
+            last_history_id = str(int(pubsub_history_id) - 10)
+            logger.warning(f"email_fetch_and_parse: no SSM historyId found, falling back to {last_history_id}")
+
+        logger.info(f"email_fetch_and_parse: querying history since historyId={last_history_id}")
+        emails = _fetch_new_emails(last_history_id)
         logger.info(f"email_fetch_and_parse: fetched {len(emails)} email(s)")
+
+        # Always advance the checkpoint to the Pub/Sub historyId
+        set_last_history_id(pubsub_history_id)
+
         if emails:
             e = emails[0]
             logger.info(f"email_fetch_and_parse: from={e.get('from_email')} subject={e.get('subject')!r} body_len={len(e.get('body', ''))}")
             return state.model_copy(update={"email_data": emails[0]})
-        logger.warning("email_fetch_and_parse: no emails returned for historyId — stopping")
+
+        logger.warning("email_fetch_and_parse: no emails returned — stopping")
         return state.model_copy(update={"intent": "none", "email_data": None})
     except Exception as e:
         logger.error(f"Email fetch error: {e}")

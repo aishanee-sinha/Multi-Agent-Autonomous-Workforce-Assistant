@@ -18,9 +18,9 @@ RUN pip install --upgrade pip && \
 # Copy all source files
 COPY state.py           ${LAMBDA_TASK_ROOT}/
 COPY slack_agent.py     ${LAMBDA_TASK_ROOT}/
-COPY calendar_cod.py  ${LAMBDA_TASK_ROOT}/
 COPY calendar_agent.py  ${LAMBDA_TASK_ROOT}/
-COPY orchestrator.py    ${LAMBDA_TASK_ROOT}/
+COPY calendar_cod.py    ${LAMBDA_TASK_ROOT}/
+COPY gmail_history.py   ${LAMBDA_TASK_ROOT}/
 
 # Lambda handler entrypoint
-CMD ["calendar_cod.handler"]
+CMD ["calendar_cod.sqs_handler"]
