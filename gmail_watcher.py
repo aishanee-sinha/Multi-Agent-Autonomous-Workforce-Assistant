@@ -56,10 +56,21 @@ def setup_gmail_watch():
                 "topicName": PUBSUB_TOPIC,
             }
         ).execute()
+        history_id = result.get("historyId")
         print(f"✅ Gmail watch registered")
-        print(f"   History ID : {result.get('historyId')}")
+        print(f"   History ID : {history_id}")
         print(f"   Expires    : {result.get('expiration')} ms epoch (~7 days)")
         print(f"   Topic      : {PUBSUB_TOPIC}")
+
+        # Seed SSM with the watch historyId so email_fetch_and_parse has a
+        # valid starting checkpoint on the first Pub/Sub notification
+        try:
+            from gmail_history import set_last_history_id
+            set_last_history_id(str(history_id))
+            print(f"✅ Seeded SSM historyId={history_id}")
+        except Exception as ssm_err:
+            print(f"⚠️  Could not write SSM (check IAM): {ssm_err}")
+
         print(f"\n⚠️  Re-run this script every 7 days to keep the watch active")
     except Exception as e:
         print(f"❌ Failed: {e}")
