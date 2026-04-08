@@ -1,9 +1,35 @@
-# requirements.txt
-# Lambda function dependencies for Meeting Summarizer Agent
-# Python 3.11 runtime
+# Core LLM + Agent framework
+langchain-openai
+langchain-core
+langgraph
 
-requests==2.31.0
-slack-sdk==3.27.1
-google-auth==2.29.0
-google-api-python-client==2.131.0
-boto3==1.34.84
+# Slack
+slack-sdk
+
+# Jira
+requests
+
+# Google (Gmail + Calendar + Drive)
+google-auth
+google-auth-httplib2
+google-auth-oauthlib
+google-api-python-client
+python-dateutil
+
+# Data validation
+pydantic
+email-validator
+
+# ── Meeting Summarizer additions ──────────────────────────────
+# AWS SDK (S3 lock, SES email, artifact storage)
+boto3
+
+# ICS calendar invite generation
+icalendar
+
+# Timezone conversion for UTC fix (FIX-3)
+pytz
+# ─────────────────────────────────────────────────────────────
+
+# Environment (local only — not needed in Lambda but harmless)
+python-dotenv
