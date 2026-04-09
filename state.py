@@ -101,6 +101,10 @@ class OrchestratorState(BaseModel):
     slack_action_value: Optional[dict] = None
     jira_account_id: Optional[str] = None
     jira_key: Optional[str] = None
+    slack_action_type: Optional[str] = None
+    slack_issue_key: Optional[str] = None
+    slack_update_status: Optional[str] = None
+    slack_comment: Optional[str] = None
 
     # ── Email/Calendar-specific ────────────────────────────────────────────
     email_source: Literal["pubsub", "direct", "unknown"] = "unknown"
