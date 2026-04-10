@@ -72,10 +72,10 @@ def _build_email_system_prompt() -> str:
 
     # Compute "next <weekday>" for all 7 days dynamically — no hardcoding
     weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    next_monday = today + timedelta(days=(7 - today.weekday()))
     next_weekdays = {}
     for target_wd, name in enumerate(weekday_names):
-        days_ahead = (target_wd - today.weekday()) % 7 or 7
-        next_weekdays[name] = today + timedelta(days=days_ahead)
+        next_weekdays[name] = next_monday + timedelta(days=target_wd)
 
     next_weekday_lines = "\n".join(
         f'     "next {name}" -> "{d.strftime("%Y-%m-%d")}"'
