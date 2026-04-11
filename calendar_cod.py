@@ -21,7 +21,7 @@ What is NOT touched:
 
 Fallback: any failure (no tokens, API error, CoD error) leaves state unchanged.
 """
-
+from __future__ import annotations
 import base64, json, logging, os, re, requests, urllib.parse
 from datetime import datetime, timezone, timedelta, date
 from typing import Literal
@@ -48,7 +48,8 @@ from calendar_agent import (
     route_after_classify,
 )
 from slack_agent import build_slack_subgraph
-from state import OrchestratorState, _llm, CALENDAR_TOKENS
+from state import OrchestratorState, _llm, CALENDAR_TOKENS, WEBHOOK_SECRET
+from meeting_agent import build_meeting_subgraph
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,18 @@ def parse_input(state: OrchestratorState) -> OrchestratorState:
         raw_value  = urllib.parse.unquote_plus(action.get("value", "{}"))
         value_dict = json.loads(raw_value) if raw_value and raw_value != "{}" else {}
 
+        # ── Meeting summarizer Confirm / Cancel buttons ─────────────────────
+        if action_id in ("confirm_summary", "cancel_summary"):
+            logger.info("[trace=%s] -> meeting_transcript (button: %s)", trace_id, action_id)
+            return state.model_copy(update={
+                "intent":             "meeting_transcript",
+                "slack_event_type":   "interactivity",
+                "slack_action_id":    action_id,
+                "slack_action_value": value_dict,
+                "channel_id":         payload["channel"]["id"],
+                "preview_ts":         payload["container"]["message_ts"],
+            })
+
         if action_id in ("create_meeting", "cancel_meeting"):
             return state.model_copy(update={
                 "intent":           "email",
@@ -139,6 +152,18 @@ def parse_input(state: OrchestratorState) -> OrchestratorState:
 
     if body.get("type") == "url_verification":
         return state.model_copy(update={"intent": "slack", "slack_event_type": "url_verification"})
+
+    # ── Meeting transcript trigger ───────────────────────────────────────────
+    if body.get("type") == "new_transcript":
+        if body.get("secret") != WEBHOOK_SECRET:
+            logger.warning("[trace=%s] Invalid webhook secret — rejecting", trace_id)
+            return state.model_copy(update={"intent": "none", "error": "Invalid secret"})
+        logger.info("[trace=%s] -> meeting_transcript (file=%s)", trace_id, body.get("file_name"))
+        return state.model_copy(update={
+            "intent":               "meeting_transcript",
+            "transcript_file_id":   body.get("file_id"),
+            "transcript_file_name": body.get("file_name", "transcript.txt"),
+        })
 
     if body.get("message", {}).get("data"):
         try:
@@ -179,7 +204,7 @@ def parse_input(state: OrchestratorState) -> OrchestratorState:
 
 def router_agent(state: OrchestratorState) -> OrchestratorState:
     trace_id = _trace_id_from_event(state.raw_event)
-    if state.intent in ("slack", "email", "none"):
+    if state.intent in ("slack", "email", "none", "meeting_transcript"):
         return state
     if state.is_bot:
         return state.model_copy(update={"intent": "none"})
@@ -216,7 +241,7 @@ def router_agent(state: OrchestratorState) -> OrchestratorState:
         return state.model_copy(update={"intent": "none", "error": str(e)})
 
 
-def route_to_agent(state: OrchestratorState) -> Literal["slack_subgraph", "calendar_subgraph", "__end__"]:
+def route_to_agent(state: OrchestratorState) -> Literal["slack_subgraph", "calendar_subgraph", "meeting_subgraph", "__end__"]:
     trace_id = _trace_id_from_event(state.raw_event)
     if state.intent == "slack":
         logger.info("[trace=%s] route -> slack_subgraph", trace_id)
@@ -224,6 +249,9 @@ def route_to_agent(state: OrchestratorState) -> Literal["slack_subgraph", "calen
     if state.intent == "email":
         logger.info("[trace=%s] route -> calendar_subgraph", trace_id)
         return "calendar_subgraph"
+    if state.intent == "meeting_transcript":
+        logger.info("[trace=%s] route -> meeting_subgraph", trace_id)
+        return "meeting_subgraph"
     return "__end__"
 
 CLIENT_ID     = os.getenv("GOOGLE_CALENDAR_CLIENT_ID")
@@ -930,16 +958,19 @@ def build_orchestrator(checkpointer=None):
     b.add_node("router_agent",      router_agent)
     b.add_node("slack_subgraph",    build_slack_subgraph())
     b.add_node("calendar_subgraph", build_calendar_subgraph_cod())
+    b.add_node("meeting_subgraph",  build_meeting_subgraph())     # ← added
 
     b.add_edge(START, "parse_input")
     b.add_edge("parse_input", "router_agent")
     b.add_conditional_edges("router_agent", route_to_agent, {
         "slack_subgraph":    "slack_subgraph",
         "calendar_subgraph": "calendar_subgraph",
+        "meeting_subgraph":  "meeting_subgraph",                  # ← added
         "__end__":           END,
     })
     b.add_edge("slack_subgraph",    END)
     b.add_edge("calendar_subgraph", END)
+    b.add_edge("meeting_subgraph",  END)                          # ← added
     return b.compile(checkpointer=checkpointer)
 
 

@@ -1,6 +1,13 @@
 """
 state.py — Shared state, config, and LLM factory
-Used by orchestrator.py, slack_agent.py, and calendar_agent.py
+Used by orchestrator.py, slack_agent.py, calendar_agent.py, and meeting_agent.py
+
+Changes vs peers' original:
+  - intent Literal extended with "meeting_transcript"
+  - slack_action_id comment updated with confirm_summary / cancel_summary
+  - Meeting summarizer env vars added (bottom of config block)
+  - "meeting" added to _llm() valid model names
+  - Meeting transcript fields added to OrchestratorState
 """
 
 import os, json, logging, operator
@@ -14,7 +21,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuration
+# Configuration — peers' original vars
 # ─────────────────────────────────────────────────────────────────────────────
 JIRA_BASE_URL    = os.environ.get("JIRA_BASE_URL")
 JIRA_EMAIL       = os.environ.get("JIRA_EMAIL")
@@ -22,25 +29,34 @@ JIRA_API_TOKEN   = os.environ.get("JIRA_API_TOKEN")
 JIRA_PROJECT_KEY = os.environ.get("JIRA_PROJECT_KEY", "KAN")
 JIRA_ISSUE_TYPE  = os.environ.get("JIRA_ISSUE_TYPE", "Task")
 SLACK_BOT_TOKEN  = os.environ.get("SLACK_BOT_TOKEN")
-SLACK_NOTIFY_CHANNEL = os.environ.get("SLACK_NOTIFY_CHANNEL")  # channel to post meeting previews
+SLACK_NOTIFY_CHANNEL = os.environ.get("SLACK_NOTIFY_CHANNEL")
 EC2_IP           = os.environ.get("EC2_IP")
 TEAM_MAP: dict   = json.loads(os.environ.get("TEAM_MAP_JSON", "{}"))
 
 GROUP_EMAILS = json.loads(os.environ.get("GROUP_EMAILS_JSON", "[]"))
 GOOGLE_TOKEN = os.environ.get("GOOGLE_TOKEN_JSON", "")
-
-# Maps email address → token filename stem
-# e.g. {"msadi.finalproject@gmail.com": "Agent", "aishanee.sinha@sjsu.edu": "Aishanee"}
-# Maps email address → refresh_token string
-# e.g. {"aishanee.sinha@sjsu.edu": "1//0abc...", "sohan.juetce@gmail.com": "1//0def..."}
 CALENDAR_TOKENS: dict = json.loads(os.environ.get("CALENDAR_TOKENS_JSON", "{}"))
+
+# ── Meeting Summarizer env vars (added) ───────────────────────────────────────
+SES_FROM_EMAIL     = os.environ.get("SES_FROM_EMAIL", "")
+PARTICIPANT_EMAILS = [
+    e.strip() for e in os.environ.get("PARTICIPANT_EMAILS", "").split(",") if e.strip()
+]
+S3_BUCKET          = os.environ.get("S3_BUCKET", "qwen-lora-weights")
+S3_PREFIX          = os.environ.get("S3_TRANSCRIPT_PREFIX", "transcript_summarizer")
+VLLM_MODEL_NAME    = os.environ.get("VLLM_MODEL_NAME", "meeting")
+WEBHOOK_SECRET     = os.environ.get("WEBHOOK_SECRET", "meeting-summarizer-secret-2026")
+GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared LLM factory
+# "meeting" added alongside peers' "slack" and "email" adapters
 # ─────────────────────────────────────────────────────────────────────────────
 def _llm(structured_output=None, model_name=None) -> ChatOpenAI:
-    assert model_name in ["Qwen/Qwen2.5-14B-Instruct-AWQ", "slack", "email"], f"Invalid model name: {model_name}"
+    assert model_name in [
+        "Qwen/Qwen2.5-14B-Instruct-AWQ", "slack", "email", "meeting"
+    ], f"Invalid model name: {model_name}"
 
     base = ChatOpenAI(
         model=model_name,
@@ -58,13 +74,14 @@ def _llm(structured_output=None, model_name=None) -> ChatOpenAI:
 class OrchestratorState(BaseModel):
     """
     Master state that flows through the entire graph.
-    Both subgraphs read/write to this same object.
+    All three subgraphs (slack, calendar, meeting) read/write to this object.
     """
     # ── Raw input ──────────────────────────────────────────────────────────
     raw_event: dict = Field(default_factory=dict)
 
     # ── Router decision ────────────────────────────────────────────────────
-    intent: Literal["slack", "email", "none", "unknown"] = "unknown"
+    # "meeting_transcript" added for meeting summarizer trigger + button clicks
+    intent: Literal["slack", "email", "none", "unknown", "meeting_transcript"] = "unknown"
     intent_reason: Optional[str] = None
 
     # ── Slack-specific (Jira flow) ─────────────────────────────────────────
@@ -78,7 +95,9 @@ class OrchestratorState(BaseModel):
     slack_ticket_summary: Optional[str] = None
     slack_ticket_assignee: Optional[str] = None
     slack_no_action: bool = False
-    slack_action_id: Optional[str] = None   # "create_jira" | "cancel_jira" | "create_meeting" | "cancel_meeting"
+    # action_ids: create_jira | cancel_jira | create_meeting | cancel_meeting
+    #             confirm_summary | cancel_summary  ← added for meeting summarizer
+    slack_action_id: Optional[str] = None
     slack_action_value: Optional[dict] = None
     jira_account_id: Optional[str] = None
     jira_key: Optional[str] = None
@@ -94,9 +113,18 @@ class OrchestratorState(BaseModel):
     meeting_attendees: list[str] = Field(default_factory=list)
     time_confidence: Optional[str] = None
     calendar_link: Optional[str] = None
-
-    # ── Pending meeting — passed via Slack button value, no DynamoDB ──────
     pending_meeting: Optional[dict] = None
+
+    # ── Meeting Transcript-specific (added) ───────────────────────────────
+    transcript_file_id:   Optional[str]   = None  # Google Drive file ID
+    transcript_file_name: Optional[str]   = None  # e.g. "demo_meeting.txt"
+    transcript_text:      Optional[str]   = None  # raw downloaded text
+    transcript_processed: Optional[str]   = None  # after preprocessor
+    meeting_summary_parsed: Optional[dict] = None  # parsed model output dict
+    meeting_triage:       Optional[list]  = None  # CoD triage results per action item
+    meeting_s3_key:       Optional[str]   = None  # S3 prefix for all artifacts
+    meeting_ics_bytes:    Optional[bytes] = None  # ICS calendar bytes
+    meeting_csv_bytes:    Optional[bytes] = None  # CSV action items bytes
 
     # ── Shared control ─────────────────────────────────────────────────────
     error: Optional[str] = None
