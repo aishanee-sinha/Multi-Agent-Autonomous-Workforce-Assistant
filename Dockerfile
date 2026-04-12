@@ -16,14 +16,7 @@ RUN pip install --upgrade pip && \
     pip install -r requirements.txt
 
 # Copy all source files
-COPY state.py           ${LAMBDA_TASK_ROOT}/
-COPY slack_agent.py     ${LAMBDA_TASK_ROOT}/
-COPY calendar_agent.py  ${LAMBDA_TASK_ROOT}/
-COPY calendar_cod.py    ${LAMBDA_TASK_ROOT}/
-COPY meeting_agent.py   ${LAMBDA_TASK_ROOT}/
-COPY gmail_history.py   ${LAMBDA_TASK_ROOT}/
-COPY redis_store.py     ${LAMBDA_TASK_ROOT}/
-COPY orchestrator.py    ${LAMBDA_TASK_ROOT}/
+COPY src/ ${LAMBDA_TASK_ROOT}/
 
 # Lambda handler entrypoint
 CMD ["orchestrator.sqs_handler"]
