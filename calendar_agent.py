@@ -595,31 +595,30 @@ def _create_calendar_event(model_output: dict, original_email: dict) -> str:
         creds   = _get_google_creds()
         service = build("calendar", "v3", credentials=creds)
 
-        def _normalize_iso_dt(raw_value: str | None) -> str | None:
-            """Normalize model datetime strings to valid RFC3339 with timezone."""
+        def _to_pdt(raw_value: str | None) -> str | None:
+            """
+            Parse the model datetime string and stamp it as PDT (UTC-7).
+            The model and email always express times in PDT, so any existing
+            timezone info is stripped before stamping — never converted.
+            Returns a valid RFC3339 string like 2026-04-14T10:00:00-07:00.
+            """
             if not raw_value:
                 return None
             text = str(raw_value).strip()
-
-            # Fix common malformed offsets like "2026-04-09T10:00:00 00:00" -> "+00:00".
+            # Strip common malformed separators before the offset
             text = re.sub(r"([0-9])\s([+-]\d{2}:\d{2})$", r"\1\2", text)
-            text = re.sub(r"([0-9])\s(\d{2}:\d{2})$", r"\1+\2", text)
-
-            dt = dp(text)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=PDT_TZ)
-            else:
-                dt = dt.astimezone(PDT_TZ)
+            text = re.sub(r"([0-9])\s(\d{2}:\d{2})$",     r"\1+\2", text)
+            # Parse then replace (not convert) timezone with PDT
+            dt = dp(text).replace(tzinfo=PDT_TZ)
             return dt.isoformat()
 
-        start_iso = _normalize_iso_dt(model_output.get("start_time"))
-        end_iso   = _normalize_iso_dt(model_output.get("end_time"))
+        start_iso = _to_pdt(model_output.get("start_time"))
+        end_iso   = _to_pdt(model_output.get("end_time"))
 
         if not start_iso:
-            start_dt  = datetime.now(PDT_TZ) + timedelta(days=1)
-            start_iso = start_dt.isoformat()
-            end_iso   = (start_dt + timedelta(hours=1)).isoformat()
-        elif not end_iso:
+            logger.error("_create_calendar_event: start_time is None — aborting")
+            return None
+        if not end_iso:
             end_iso = (dp(start_iso) + timedelta(hours=1)).isoformat()
 
         attendees = (
@@ -630,8 +629,8 @@ def _create_calendar_event(model_output: dict, original_email: dict) -> str:
             "summary":     model_output.get("title") or "Meeting",
             "location":    model_output.get("location") or "",
             "description": f"Auto-created from email. Subject: {original_email.get('subject', '')}",
-            "start":       {"dateTime": start_iso},
-            "end":         {"dateTime": end_iso},
+            "start":       {"dateTime": start_iso, "timeZone": "America/Los_Angeles"},
+            "end":         {"dateTime": end_iso,   "timeZone": "America/Los_Angeles"},
             "attendees":   attendees,
         }
 
