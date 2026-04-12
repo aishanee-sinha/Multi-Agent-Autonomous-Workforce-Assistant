@@ -23,7 +23,7 @@ echo "  Data: ${CHROMADB_DATA}"
 # 1. Install ChromaDB if not present
 if ! python3 -c "import chromadb" 2>/dev/null; then
     echo "Installing ChromaDB..."
-    pip install chromadb>=0.4.0
+    pip install chromadb>=0.4.0 --break-system-packages
 else
     echo "ChromaDB already installed."
 fi
