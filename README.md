@@ -1,46 +1,67 @@
-# Slack-Jira integration
+# Multi-Agent Autonomous Workforce Assistant
 
-## Overview
-The Multi-Agent Autonomous Workforce Assistant is a project designed to streamline task management by integrating Slack messages with Jira issue tracking. This system utilizes natural language processing (NLP) techniques to extract actionable items from Slack conversations and create or update Jira tickets accordingly.
+A multi-agent workplace automation system with two production workflows and a full R\&D pipeline:
 
-## Project Structure
-- **DataPreprocessing.ipynb**: This notebook handles the preprocessing of Slack message data, including parsing XML files and cleaning the text for further analysis.
-- **DataLabeling.ipynb**: This notebook uses the Gemini model to label Slack messages with task-related information, such as task summaries, assignees, and issue creation dates.
-- **FinetuneLLM.ipynb**: This notebook is responsible for fine-tuning a language model (QLoRA) to extract task-related information from Slack messages and format it for Jira.
-- **Requirements**: The project requires several Python packages, including `pandas`, `transformers`, `sentence-transformers`, `requests`, and others specified in the notebooks.
+- **Slack → Jira (human-in-the-loop)**: propose a Jira ticket from a Slack message, create it only after approval.
+- **Email → Google Calendar (human-in-the-loop)**: detect meeting intent from new emails, propose a calendar event in Slack, create it only after approval.
+- **Model training notebooks**: data labeling, preprocessing, fine-tuning (LoRA), and evaluation for meeting extraction, meeting summarization, and Slack/Jira extraction.
 
-## Installation
-To set up the project, ensure you have Python installed, then install the required packages using pip:
+## What’s in this repo
 
-```bash
-pip install -r requirements.txt
+This repository is split into:
+
+1. **AWSOrchestration** — the event-driven orchestration layer designed to run on **AWS Lambda**, backed by a self-hosted **vLLM OpenAI-compatible endpoint** (typically on GPU EC2).
+2. **DataProcessingModelTraining** — Jupyter notebooks for labeling + training + evaluation of task-specific models/adapters.
+
+## Architecture (production)
+
+At a high level, the Lambda handler parses the incoming event (Slack event, Slack button click, Gmail Pub/Sub push, or a direct test payload), routes intent, then runs the relevant subgraph.
+
+```
+Lambda handler
+  ├─ parse_input   → detects event type (Slack / Gmail PubSub / interactivity)
+  └─ router_agent  → LLM routes: "slack" | "email" | "none"
+         ├─ Slack subgraph    → Jira ticket proposal + approval + creation
+         └─ Calendar subgraph → meeting extraction + approval + calendar creation
 ```
 
-## Usage
-1. **Data Preprocessing**: Run the `DataPreprocessing.ipynb` notebook to parse Slack message XML files and save the cleaned messages to a CSV file.
-2. **Data Labeling**: Use the `DataLabeling.ipynb` notebook to label Slack messages with task-related information using the Gemini model. The labeled data will be saved for further processing.
-3. **Fine-tuning the Model**: Execute the `FinetuneLLM.ipynb` notebook to fine-tune the language model on the labeled data.
-4. **Creating/Updating Jira Issues**: Use the provided functions to create or update Jira issues based on Slack messages. Ensure that your Jira credentials and project details are set in the environment variables.
+The orchestration graph is implemented with **LangGraph** and a single `OrchestratorState` model (no database required for button callbacks — the pending payload is embedded in Slack button values).
 
-## Environment Variables
-Set the following environment variables for Jira integration:
-- `JIRA_BASE_URL`: Your Jira instance URL (e.g., `https://your-domain.atlassian.net`)
-- `JIRA_EMAIL`: Your Jira account email
-- `JIRA_API_TOKEN`: Your Jira API token
-- `JIRA_PROJECT_KEY`: The key of the Jira project where issues will be created
-- `JIRA_ISSUE_TYPE`: The type of issue to create (e.g., Task, Bug)
+## Repository structure
 
-## Example
-To create a new Jira issue from a Slack message, use the following code snippet:
-
-```python
-slack_msg = {
-    "timestamp": "2025-11-02T08:14:27.439600",
-    "text": "<@User> Can you complete the task by tomorrow?"
-}
-
-new_key = create_issue(slack_msg)
-print("Created:", new_key)
+```text
+.
+├── AWSOrchestration/
+│   ├── orchestrator.py          # Lambda handler + routing + graph wiring
+│   ├── state.py                 # Shared config + OrchestratorState + LLM factory
+│   ├── slack_agent.py           # Slack/Jira subgraph
+│   ├── calendar_agent.py        # Email/Calendar subgraph
+│   ├── gmail_watcher.py         # Helper: register Gmail → Pub/Sub watch
+│   ├── get_google_token.py      # Helper: generate OAuth token JSON
+│   ├── Dockerfile               # Lambda container build
+│   ├── requirements.txt         # Lambda container Python deps
+│   ├── Readme.MD                # Deep-dive architecture + deployment
+│   ├── Runbook.md               # Operational runbook (EC2 + Docker + Lambda)
+│   └── Meeting_Summarizer/
+│       ├── ms_agent_call.py
+│       ├── google_apps_script.js
+│       └── README.md
+└── DataProcessingModelTraining/
+     ├── EmailCalendar/
+     │   ├── DataLabelling_Email.ipynb
+     │   ├── DataPreprocessing_Email.ipynb
+     │   ├── Finetuning_Email.ipynb
+     │   └── Evaluation_Email.ipynb
+     ├── MeetingSummarizer/
+     │   ├── Phase4_Meeting_Summarizer_14B.ipynb
+     │   ├── Phase4_Evaluation_A100_Colab.ipynb
+     │   └── README.md
+     └── Slack_Jira/
+          ├── DataLabeling.ipynb
+          ├── DataPreprocessing.ipynb
+          ├── SlackJiraModelFT&Eval.ipynb
+          ├── Slack_jira_GEval.ipynb
+          └── readme.md
 ```
 
 ## Getting started
