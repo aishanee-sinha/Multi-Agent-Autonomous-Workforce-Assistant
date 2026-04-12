@@ -119,6 +119,9 @@ class OrchestratorState(BaseModel):
     calendar_link: Optional[str] = None
     pending_meeting: Optional[dict] = None
 
+    # ── Redis session ID — carried from parse_input to create/cancel nodes ─
+    session_id: Optional[str] = None
+
     # ── Meeting Transcript-specific (added) ───────────────────────────────
     transcript_file_id:   Optional[str]   = None  # Google Drive file ID
     transcript_file_name: Optional[str]   = None  # e.g. "demo_meeting.txt"

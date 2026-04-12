@@ -113,10 +113,11 @@ def parse_input(state: OrchestratorState) -> OrchestratorState:
         raw_value  = urllib.parse.unquote_plus(action.get("value", ""))
         # Button values are now Redis session IDs (UUID strings).
         # "cancel" is a sentinel for cancel buttons which carry no payload.
-        if raw_value and raw_value not in ("", "cancel", "{}"):
-            value_dict = load_session(raw_value) or {}
+        session_id = raw_value if raw_value and raw_value not in ("", "cancel", "{}") else None
+        if session_id:
+            value_dict = load_session(session_id) or {}
             if not value_dict:
-                logger.warning("[trace=%s] session %s expired or missing", trace_id, raw_value)
+                logger.warning("[trace=%s] session %s expired or missing", trace_id, session_id)
         else:
             value_dict = {}
 
@@ -128,6 +129,7 @@ def parse_input(state: OrchestratorState) -> OrchestratorState:
                 "slack_event_type":   "interactivity",
                 "slack_action_id":    action_id,
                 "slack_action_value": value_dict,
+                "session_id":         session_id,
                 "channel_id":         payload["channel"]["id"],
                 "preview_ts":         payload["container"]["message_ts"],
             })
@@ -138,6 +140,7 @@ def parse_input(state: OrchestratorState) -> OrchestratorState:
                 "slack_event_type": "interactivity",
                 "slack_action_id":  action_id,
                 "pending_meeting":  value_dict if action_id == "create_meeting" else None,
+                "session_id":       session_id,
                 "channel_id":       payload["channel"]["id"],
                 "preview_ts":       payload["container"]["message_ts"],
             })
@@ -146,6 +149,7 @@ def parse_input(state: OrchestratorState) -> OrchestratorState:
             "slack_event_type":   "interactivity",
             "slack_action_id":    action_id,
             "slack_action_value": value_dict,
+            "session_id":         session_id,
             "channel_id":         payload["channel"]["id"],
             "preview_ts":         payload["container"]["message_ts"],
         })
