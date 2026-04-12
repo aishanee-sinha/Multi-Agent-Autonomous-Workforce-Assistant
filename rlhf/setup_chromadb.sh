@@ -13,7 +13,7 @@
 set -euo pipefail
 
 CHROMADB_PORT="${CHROMADB_PORT:-8001}"
-CHROMADB_DATA="${CHROMADB_DATA:-/data/chromadb}"
+CHROMADB_DATA="${CHROMADB_DATA:-./chromadb_data}"
 CHROMADB_HOST="${CHROMADB_HOST:-0.0.0.0}"
 
 echo "=== ChromaDB Setup ==="
