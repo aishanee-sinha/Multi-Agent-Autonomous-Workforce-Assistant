@@ -31,10 +31,12 @@ fi
 # 2. Create data directory
 mkdir -p "${CHROMADB_DATA}"
 
+CHROMA_CMD=$(command -v chroma || echo "$HOME/.local/bin/chroma")
+
 # 3. Start ChromaDB server
 if [[ "${1:-}" == "--bg" ]]; then
-    echo "Starting ChromaDB in background..."
-    nohup chroma run \
+    echo "Starting ChromaDB in background using $CHROMA_CMD..."
+    nohup "$CHROMA_CMD" run \
         --host "${CHROMADB_HOST}" \
         --port "${CHROMADB_PORT}" \
         --path "${CHROMADB_DATA}" \
@@ -42,8 +44,8 @@ if [[ "${1:-}" == "--bg" ]]; then
     echo "ChromaDB PID: $!"
     echo "Logs: /var/log/chromadb.log"
 else
-    echo "Starting ChromaDB in foreground..."
-    chroma run \
+    echo "Starting ChromaDB in foreground using $CHROMA_CMD..."
+    "$CHROMA_CMD" run \
         --host "${CHROMADB_HOST}" \
         --port "${CHROMADB_PORT}" \
         --path "${CHROMADB_DATA}"
