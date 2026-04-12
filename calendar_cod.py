@@ -136,23 +136,38 @@ def parse_input(state: OrchestratorState) -> OrchestratorState:
 
         # ── Slot selection buttons (email CoD flow) ────────────────────────
         if action_id in ("select_slot_0", "select_slot_1", "select_slot_2"):
-            logger.info("[trace=%s] -> email slot selected (action_id=%s)", trace_id, action_id)
-            # value_dict contains the selected slot's pending payload.
-            # session_id is that specific slot's Redis key.
-            # all_session_ids (comma-joined) is stored inside value_dict for cancel cleanup.
+            slot_index = int(action_id[-1])  # 0, 1, or 2
+            all_slots  = value_dict.get("all_proposed_slots", [])
+            chosen     = all_slots[slot_index] if slot_index < len(all_slots) else {}
+            logger.info(
+                "[trace=%s] -> email slot %d selected session=%s start=%s",
+                trace_id, slot_index, session_id, chosen.get("start"),
+            )
+            pending_meeting = {
+                "email_data": value_dict.get("email_data"),
+                "model_output": {
+                    "title":           value_dict.get("meeting_title"),
+                    "start_time":      chosen.get("start"),
+                    "end_time":        chosen.get("end"),
+                    "location":        value_dict.get("meeting_location"),
+                    "attendees":       value_dict.get("meeting_attendees", []),
+                    "time_confidence": value_dict.get("time_confidence"),
+                },
+                "all_proposed_slots": all_slots,
+                "selected_slot_index": slot_index,
+            }
             return state.model_copy(update={
                 "intent":           "email",
                 "slack_event_type": "interactivity",
-                "slack_action_id":  "create_meeting",  # reuse existing create path
-                "pending_meeting":  value_dict,
-                "selected_slot":    value_dict.get("model_output"),
+                "slack_action_id":  "create_meeting",
+                "pending_meeting":  pending_meeting,
+                "selected_slot":    pending_meeting["model_output"],
                 "session_id":       session_id,
                 "channel_id":       payload["channel"]["id"],
                 "preview_ts":       payload["container"]["message_ts"],
             })
 
         if action_id == "cancel_meeting":
-            # session_id here is a comma-joined string of all slot session IDs
             return state.model_copy(update={
                 "intent":           "email",
                 "slack_event_type": "interactivity",
