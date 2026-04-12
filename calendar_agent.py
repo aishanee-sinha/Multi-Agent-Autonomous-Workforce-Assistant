@@ -19,7 +19,7 @@ Routing within subgraph:
 """
 
 import base64, json, logging, re
-from redis_store import save_session
+from redis_store import save_session, record_feedback
 from datetime import datetime, timezone, timedelta
 from typing import Literal
 from pydantic import BaseModel, EmailStr, EmailStr, Field
@@ -366,6 +366,19 @@ def email_create_calendar(state: OrchestratorState) -> OrchestratorState:
 
     link = _create_calendar_event(model_output, original_email)
 
+    # Record human feedback in Redis
+    if state.session_id:
+        if link:
+            record_feedback(state.session_id, "accepted", {
+                "calendar_link":    link,
+                "meeting_title":    model_output.get("title"),
+                "meeting_start":    model_output.get("start_time"),
+                "meeting_end":      model_output.get("end_time"),
+                "meeting_attendees": model_output.get("attendees", []),
+            })
+        else:
+            record_feedback(state.session_id, "failed", {"reason": "calendar_create_error"})
+
     # Update the Slack preview card with result
     title = model_output.get("title") or "Meeting"
     try:
@@ -399,6 +412,9 @@ def email_create_calendar(state: OrchestratorState) -> OrchestratorState:
 
 def email_post_cancel(state: OrchestratorState) -> OrchestratorState:
     """User clicked ❌ Cancel — update the Slack card."""
+    if state.session_id:
+        record_feedback(state.session_id, "rejected")
+
     client = _logged_slack(WebClient(token=SLACK_BOT_TOKEN))
     try:
         client.chat_update(

@@ -17,7 +17,7 @@ Entry routing (route_slack_entry):
 """
 
 import json, logging
-from redis_store import save_session
+from redis_store import save_session, record_feedback
 
 import requests
 from requests.auth import HTTPBasicAuth
@@ -223,6 +223,17 @@ def slack_create_jira(state: OrchestratorState) -> OrchestratorState:
 
 def slack_post_result(state: OrchestratorState) -> OrchestratorState:
     """Update the Slack preview message with the final outcome."""
+    if state.session_id:
+        if state.jira_key:
+            record_feedback(state.session_id, "accepted", {
+                "jira_key":     state.jira_key,
+                "jira_url":     f"{JIRA_BASE_URL}/browse/{state.jira_key}",
+                "summary":      (state.slack_action_value or {}).get("s"),
+                "assignee":     (state.slack_action_value or {}).get("a"),
+            })
+        else:
+            record_feedback(state.session_id, "failed", {"reason": state.error or "jira_create_error"})
+
     client = _logged_slack(WebClient(token=SLACK_BOT_TOKEN))
     msg = (
         f"✅ *Ticket Created:* <{JIRA_BASE_URL}/browse/{state.jira_key}|{state.jira_key}>"
@@ -238,6 +249,9 @@ def slack_post_result(state: OrchestratorState) -> OrchestratorState:
 
 def slack_post_cancel(state: OrchestratorState) -> OrchestratorState:
     """Update the Slack message to show cancellation."""
+    if state.session_id:
+        record_feedback(state.session_id, "rejected")
+
     client = _logged_slack(WebClient(token=SLACK_BOT_TOKEN))
     try:
         client.chat_update(
