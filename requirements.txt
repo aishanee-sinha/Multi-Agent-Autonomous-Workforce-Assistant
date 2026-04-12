@@ -24,6 +24,7 @@ email-validator
 redis[hiredis]
 
 # RLHF (ChromaDB for DPO storing)
+numpy<2.0.0
 chromadb-client
 
 # Environment (local only — not needed in Lambda but harmless)
