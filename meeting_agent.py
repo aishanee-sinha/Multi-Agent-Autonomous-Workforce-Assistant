@@ -56,6 +56,8 @@ from state import (
     SLACK_BOT_TOKEN, SLACK_NOTIFY_CHANNEL,
     SES_FROM_EMAIL, PARTICIPANT_EMAILS, _llm,
 )
+from feedback_logger import log_feedback
+from rag_retriever import get_similar_approved, format_as_few_shot
 
 logger = logging.getLogger(__name__)
 
@@ -702,7 +704,21 @@ def meeting_summarize(state: OrchestratorState) -> OrchestratorState:
         raw_output = _run_chunked_inference(transcript)
         parsed     = _parse_model_output(raw_output)
         logger.info("Summarized: %d action items", len(parsed.get("actions_json", [])))
-        return state.model_copy(update={"meeting_summary_parsed": parsed})
+
+        # ── Save prompt+response for RLHF feedback logging later ───────
+        prompt_log = json.dumps({"transcript_preview": transcript[:500],
+                                  "file_name": state.transcript_file_name})
+        response_log = json.dumps({
+            "abstract": parsed.get("abstract", "")[:500],
+            "n_actions": len(parsed.get("actions_json", [])),
+            "decisions": parsed.get("decisions", "")[:300],
+        })
+
+        return state.model_copy(update={
+            "meeting_summary_parsed": parsed,
+            "llm_prompt_log": prompt_log,
+            "llm_response_log": response_log,
+        })
     except Exception as e:
         logger.error("Summarize failed: %s", e)
         return state.model_copy(update={"error": str(e)})
@@ -969,6 +985,19 @@ def meeting_send_email(state: OrchestratorState) -> OrchestratorState:
         )
         logger.info("Email sent to %s", PARTICIPANT_EMAILS)
 
+        # ── RLHF: log confirmed feedback ──────────────────────────────────
+        if state.llm_prompt_log:
+            try:
+                log_feedback(
+                    flow="meeting",
+                    prompt=state.llm_prompt_log,
+                    response=state.llm_response_log or "",
+                    human_decision="approved",
+                    metadata={"file_name": file_name, "s3_key": s3_key},
+                )
+            except Exception as fb_err:
+                logger.warning("RLHF feedback log failed (approved): %s", fb_err)
+
         if channel_id and preview_ts:
             slack.chat_update(
                 channel=channel_id, ts=preview_ts, blocks=None,
@@ -988,6 +1017,19 @@ def meeting_send_email(state: OrchestratorState) -> OrchestratorState:
 # Node 8b: meeting_post_cancel
 # ─────────────────────────────────────────────────────────────────────────────
 def meeting_post_cancel(state: OrchestratorState) -> OrchestratorState:
+    # ── RLHF: log cancelled feedback ────────────────────────────────────
+    if state.llm_prompt_log:
+        try:
+            log_feedback(
+                flow="meeting",
+                prompt=state.llm_prompt_log,
+                response=state.llm_response_log or "",
+                human_decision="cancelled",
+                metadata={"channel": state.channel_id},
+            )
+        except Exception as e:
+            logger.warning("RLHF feedback log failed (cancelled): %s", e)
+
     if state.channel_id and state.preview_ts:
         try:
             WebClient(token=SLACK_BOT_TOKEN).chat_update(

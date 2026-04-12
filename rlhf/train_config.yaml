@@ -1,0 +1,43 @@
+# DPO Training Configuration
+# ===========================
+# Per-flow hyperparameters for DPO fine-tuning.
+# These override defaults in train_dpo.py.
+
+slack:
+  adapter_name: "slack"
+  lora_path: "/data/lora_adapters/slack"
+  dataset_path: "rlhf/datasets/slack_seed.jsonl"
+  beta: 0.1
+  lr: 5.0e-7
+  epochs: 2
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  max_length: 512
+  lora_r: 16
+  lora_alpha: 32
+
+email:
+  adapter_name: "email"
+  lora_path: "/data/lora_adapters/email"
+  dataset_path: "rlhf/datasets/email_seed.jsonl"
+  beta: 0.1
+  lr: 5.0e-7
+  epochs: 3
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  max_length: 512
+  lora_r: 16
+  lora_alpha: 32
+
+meeting:
+  adapter_name: "meeting"
+  lora_path: "/data/lora_adapters/meeting"
+  dataset_path: "rlhf/datasets/meeting_seed.jsonl"
+  beta: 0.1
+  lr: 5.0e-7
+  epochs: 2
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  max_length: 512
+  lora_r: 16
+  lora_alpha: 32

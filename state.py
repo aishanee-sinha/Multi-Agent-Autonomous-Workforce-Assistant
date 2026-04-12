@@ -48,6 +48,10 @@ VLLM_MODEL_NAME    = os.environ.get("VLLM_MODEL_NAME", "meeting")
 WEBHOOK_SECRET     = os.environ.get("WEBHOOK_SECRET", "meeting-summarizer-secret-2026")
 GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
 
+# ── RLHF / ChromaDB env vars (added) ─────────────────────────────────────────
+CHROMADB_HOST = os.environ.get("CHROMADB_HOST", EC2_IP or "localhost")
+CHROMADB_PORT = os.environ.get("CHROMADB_PORT", "8001")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared LLM factory
@@ -125,6 +129,10 @@ class OrchestratorState(BaseModel):
     meeting_s3_key:       Optional[str]   = None  # S3 prefix for all artifacts
     meeting_ics_bytes:    Optional[bytes] = None  # ICS calendar bytes
     meeting_csv_bytes:    Optional[bytes] = None  # CSV action items bytes
+
+    # ── RLHF feedback tracking (added) ────────────────────────────────────
+    llm_prompt_log:   Optional[str] = None  # serialized LLM prompt for feedback
+    llm_response_log: Optional[str] = None  # serialized LLM response for feedback
 
     # ── Shared control ─────────────────────────────────────────────────────
     error: Optional[str] = None

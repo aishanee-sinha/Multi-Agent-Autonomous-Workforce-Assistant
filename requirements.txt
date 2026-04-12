@@ -22,3 +22,6 @@ email-validator
 
 # Environment (local only — not needed in Lambda but harmless)
 python-dotenv
+
+# RLHF (ChromaDB HTTP client — talks to ChromaDB server on EC2)
+chromadb-client

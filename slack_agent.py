@@ -35,6 +35,8 @@ from state import (
     SLACK_BOT_TOKEN, TEAM_MAP,
     _llm,
 )
+from feedback_logger import log_feedback
+from rag_retriever import get_similar_approved, format_as_few_shot
 
 logger = logging.getLogger(__name__)
 
@@ -77,18 +79,34 @@ class JiraTicket(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 def slack_extract_ticket(state: OrchestratorState) -> OrchestratorState:
     """LLM extracts a structured Jira ticket from the Slack message text."""
+    # ── RAG: retrieve similar approved examples ─────────────────────────
+    examples = get_similar_approved("slack", state.user_text, n_results=2)
+    few_shot = format_as_few_shot(examples)
+
     sys_msg = (
         "You are a Jira assistant. Extract task details from the user's Slack message. "
         "For 'assignee', return the Slack User ID or name. "
         "Set no_action=True if the message contains no actionable task."
     )
+    if few_shot:
+        sys_msg += "\n" + few_shot
+
     llm = _llm(structured_output=JiraTicket, model_name="slack")
     try:
-        ticket: JiraTicket = llm.invoke([SystemMessage(content=sys_msg), HumanMessage(content=state.user_text)])
+        human_msg = state.user_text
+        ticket: JiraTicket = llm.invoke([SystemMessage(content=sys_msg), HumanMessage(content=human_msg)])
+
+        # ── Save prompt+response for feedback logging later ─────────────
+        prompt_log = json.dumps([{"role": "system", "content": sys_msg},
+                                  {"role": "user", "content": human_msg}])
+        response_log = json.dumps(ticket.dict())
+
         return state.model_copy(update={
             "slack_ticket_summary": ticket.task_summary,
             "slack_ticket_assignee": ticket.assignee,
             "slack_no_action": ticket.no_action,
+            "llm_prompt_log": prompt_log,
+            "llm_response_log": response_log,
         })
     except Exception as e:
         logger.error(f"Slack extract error: {e}")
@@ -222,6 +240,19 @@ def slack_create_jira(state: OrchestratorState) -> OrchestratorState:
 
 def slack_post_result(state: OrchestratorState) -> OrchestratorState:
     """Update the Slack preview message with the final outcome."""
+    # ── RLHF: log approved feedback ─────────────────────────────────────
+    if state.jira_key and state.llm_prompt_log:
+        try:
+            log_feedback(
+                flow="slack",
+                prompt=state.llm_prompt_log,
+                response=state.llm_response_log or "",
+                human_decision="approved",
+                metadata={"channel": state.channel_id, "jira_key": state.jira_key},
+            )
+        except Exception as e:
+            logger.warning("RLHF feedback log failed (approved): %s", e)
+
     client = _logged_slack(WebClient(token=SLACK_BOT_TOKEN))
     msg = (
         f"✅ *Ticket Created:* <{JIRA_BASE_URL}/browse/{state.jira_key}|{state.jira_key}>"
@@ -237,6 +268,19 @@ def slack_post_result(state: OrchestratorState) -> OrchestratorState:
 
 def slack_post_cancel(state: OrchestratorState) -> OrchestratorState:
     """Update the Slack message to show cancellation."""
+    # ── RLHF: log cancelled feedback ────────────────────────────────────
+    if state.llm_prompt_log:
+        try:
+            log_feedback(
+                flow="slack",
+                prompt=state.llm_prompt_log,
+                response=state.llm_response_log or "",
+                human_decision="cancelled",
+                metadata={"channel": state.channel_id},
+            )
+        except Exception as e:
+            logger.warning("RLHF feedback log failed (cancelled): %s", e)
+
     client = _logged_slack(WebClient(token=SLACK_BOT_TOKEN))
     try:
         client.chat_update(

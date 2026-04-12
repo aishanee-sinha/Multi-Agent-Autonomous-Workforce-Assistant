@@ -22,6 +22,8 @@ COPY calendar_agent.py  ${LAMBDA_TASK_ROOT}/
 COPY calendar_cod.py    ${LAMBDA_TASK_ROOT}/
 COPY meeting_agent.py   ${LAMBDA_TASK_ROOT}/
 COPY gmail_history.py   ${LAMBDA_TASK_ROOT}/
+COPY feedback_logger.py ${LAMBDA_TASK_ROOT}/
+COPY rag_retriever.py   ${LAMBDA_TASK_ROOT}/
 
 # Lambda handler entrypoint
 CMD ["calendar_cod.sqs_handler"]

@@ -32,6 +32,8 @@ from state import (
     GROUP_EMAILS, GOOGLE_TOKEN, SLACK_BOT_TOKEN, SLACK_NOTIFY_CHANNEL,
     _llm,
 )
+from feedback_logger import log_feedback
+from rag_retriever import get_similar_approved, format_as_few_shot
 
 logger = logging.getLogger(__name__)
 
@@ -253,17 +255,29 @@ def email_classify(state: OrchestratorState) -> OrchestratorState:
 
     llm = _llm(structured_output=EmailMeetingDetails, model_name="Qwen/Qwen2.5-14B-Instruct-AWQ")
     try:
-        data = llm.invoke([SystemMessage(content=_build_email_system_prompt()), HumanMessage(content=email_text)])
-        # raw  = resp.content if hasattr(resp, "content") else str(resp)
-        # raw  = re.sub(r"```(?:json)?|```", "", raw).strip()
-        # data = EmailMeetingDetails(**json.loads(raw))
+        # ── RAG: retrieve similar approved email classifications ────────
+        examples = get_similar_approved("email", email_text, n_results=2)
+        few_shot = format_as_few_shot(examples)
+        sys_prompt = _build_email_system_prompt()
+        if few_shot:
+            sys_prompt += "\n" + few_shot
+
+        data = llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=email_text)])
+
+        # ── Save prompt+response for feedback logging later ─────────────
+        prompt_log = json.dumps([{"role": "system", "content": sys_prompt},
+                                  {"role": "user", "content": email_text}])
+        response_log = json.dumps(data.dict(), default=str)
+
         return state.model_copy(update={
             "is_meeting":        data.is_meeting,
             "meeting_title":     data.title,
-            "meeting_start":     data.start_window,   # date string YYYY-MM-DD — search window start
-            "meeting_end":       data.end_window,     # date string YYYY-MM-DD — search window end
+            "meeting_start":     data.start_window,
+            "meeting_end":       data.end_window,
             "meeting_attendees": data.attendees or [],
             "time_confidence":   data.time_confidence,
+            "llm_prompt_log":    prompt_log,
+            "llm_response_log":  response_log,
         })
     except Exception as e:
         logger.error(f"Email classify error: {e}")
@@ -366,6 +380,20 @@ def email_create_calendar(state: OrchestratorState) -> OrchestratorState:
 
     # Update the Slack preview card with result
     title = model_output.get("title") or "Meeting"
+
+    # ── RLHF: log approved feedback ─────────────────────────────────────
+    if state.llm_prompt_log:
+        try:
+            log_feedback(
+                flow="email",
+                prompt=state.llm_prompt_log,
+                response=state.llm_response_log or "",
+                human_decision="approved",
+                metadata={"channel": state.channel_id, "title": title},
+            )
+        except Exception as e:
+            logger.warning("RLHF feedback log failed (approved): %s", e)
+
     try:
         if link:
             client.chat_update(
@@ -397,6 +425,19 @@ def email_create_calendar(state: OrchestratorState) -> OrchestratorState:
 
 def email_post_cancel(state: OrchestratorState) -> OrchestratorState:
     """User clicked ❌ Cancel — update the Slack card."""
+    # ── RLHF: log cancelled feedback ────────────────────────────────────
+    if state.llm_prompt_log:
+        try:
+            log_feedback(
+                flow="email",
+                prompt=state.llm_prompt_log,
+                response=state.llm_response_log or "",
+                human_decision="cancelled",
+                metadata={"channel": state.channel_id},
+            )
+        except Exception as e:
+            logger.warning("RLHF feedback log failed (cancelled): %s", e)
+
     client = _logged_slack(WebClient(token=SLACK_BOT_TOKEN))
     try:
         client.chat_update(
