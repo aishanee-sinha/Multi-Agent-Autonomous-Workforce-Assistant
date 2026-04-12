@@ -67,7 +67,14 @@ def _logged_slack(client: WebClient) -> WebClient:
 # ─────────────────────────────────────────────────────────────────────────────
 def _build_email_system_prompt() -> str:
     from datetime import date as _date
-    today     = _date.today()
+
+    # All dates and times in this project are PDT (UTC-7). We derive "today"
+    # in PDT explicitly so Lambda (which runs in UTC) computes the right date.
+    _pdt_now  = datetime.now(tz=PDT_TZ)
+    today     = _pdt_now.date()
+    _tz_name  = "PDT"
+    _tz_offset = "-07:00"
+
     today_str = today.strftime("%Y-%m-%d (%A)")
     tomorrow  = today + timedelta(days=1)
 
@@ -79,34 +86,18 @@ def _build_email_system_prompt() -> str:
         next_weekdays[name] = today + timedelta(days=days_ahead)
 
     next_weekday_lines = "\n".join(
-        f'     "next {name}" -> "{d.strftime("%Y-%m-%d")}"'
+        f'     "{name}" / "next {name}" -> "{d.strftime("%Y-%m-%d")}"'
         for name, d in next_weekdays.items()
     )
     next_monday = next_weekdays["Monday"]
     next_friday = next_weekdays["Friday"]
     this_friday = today + timedelta(days=(4 - today.weekday()) % 7)
 
-    # Compute local UTC offset dynamically (e.g. "+05:30", "-07:00")
-    _now        = datetime.now().astimezone()
-    _tz_name    = _now.strftime("%Z")                          # e.g. "IST", "PDT", "EST"
-    _raw_offset = _now.strftime("%z")                          # e.g. "+0530", "-0700"
-    _tz_offset  = _raw_offset[:3] + ":" + _raw_offset[3:]     # e.g. "+05:30", "-07:00"
-
     return f"""You are a meeting intent extraction system.
 
 TASK: Analyze emails and extract meeting intent and a SEARCH WINDOW for scheduling.
 Do NOT extract exact times — extract the date range the sender intends to meet within.
 A downstream scheduler will find the best available slot inside that window.
-
-OUTPUT FORMAT (JSON only, no explanations):
-{{
-  "is_meeting": boolean,
-  "title": string or null,
-  "attendees": array of email addresses,
-  "start_window": "YYYY-MM-DDTHH:MM:SS{_tz_offset}" or null,
-  "end_window": "YYYY-MM-DDTHH:MM:SS{_tz_offset}" or null,
-  "time_confidence": "high" | "medium" | "low" | "none"
-}}
 
 EXTRACTION RULES:
 
@@ -132,7 +123,7 @@ All datetimes use the local timezone: {_tz_name} (UTC{_tz_offset}).
 
 4. START_WINDOW — earliest datetime the scheduler should begin searching (YYYY-MM-DDTHH:MM:SS{_tz_offset}):
    TODAY is {today_str}. "tomorrow" is {tomorrow.strftime("%Y-%m-%d")}.
-   Use the exact dates below for "next <weekday>" references:
+   Use the exact dates below for bare weekday OR "next <weekday>" references:
 {next_weekday_lines}
    - "next week" (no specific day) -> next Monday = "{next_monday.strftime('%Y-%m-%d')}"
    - "this week" (no specific day) -> tomorrow = "{tomorrow.strftime('%Y-%m-%d')}"
@@ -171,8 +162,6 @@ All datetimes use the local timezone: {_tz_name} (UTC{_tz_offset}).
 
 CRITICAL: ALWAYS return valid JSON. NEVER add explanations."""
 
-
-EMAIL_SYSTEM_PROMPT = _build_email_system_prompt()
 
 class EmailMeetingDetails(BaseModel):
     is_meeting: bool
