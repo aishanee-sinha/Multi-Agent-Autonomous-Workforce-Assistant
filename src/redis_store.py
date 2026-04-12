@@ -28,6 +28,76 @@ from uuid import uuid4
 import redis
 
 from state import REDIS_URL, SESSION_TTL_SECONDS
+import os
+
+CHROMADB_HOST   = os.environ.get("CHROMADB_HOST", os.environ.get("EC2_IP", "localhost"))
+CHROMADB_PORT   = int(os.environ.get("CHROMADB_PORT", "8001"))
+
+_chroma_client = None
+
+def _get_chromadb():
+    """Lazy-load ChromaDB HTTP client — only imported when first used."""
+    global _chroma_client
+    if _chroma_client is None:
+        try:
+            import chromadb
+            _chroma_client = chromadb.HttpClient(
+                host=CHROMADB_HOST,
+                port=CHROMADB_PORT,
+            )
+            logger.info("redis_store: connected to ChromaDB at %s:%d", CHROMADB_HOST, CHROMADB_PORT)
+        except Exception as e:
+            logger.warning("redis_store: ChromaDB connection failed: %s", e)
+            return None
+    return _chroma_client
+
+def _get_collection(flow: str):
+    """Get or create the ChromaDB collection for a given flow."""
+    client = _get_chromadb()
+    if client is None:
+        return None
+    try:
+        return client.get_or_create_collection(
+            name=f"{flow}_feedback",
+            metadata={"description": f"RLHF feedback for {flow} flow"},
+        )
+    except Exception as e:
+        logger.warning("redis_store: failed to get collection '%s_feedback': %s", flow, e)
+        return None
+
+def _write_chromadb(
+    flow: str,
+    feedback_id: str,
+    prompt: str,
+    response: str,
+    human_decision: str,
+    timestamp: str,
+    metadata: dict | None,
+) -> None:
+    collection = _get_collection(flow)
+    if collection is None:
+        return
+
+    response_truncated = response[:8000] if response else ""
+
+    try:
+        collection.add(
+            documents=[prompt],
+            metadatas=[{
+                "flow": flow,
+                "decision": human_decision,
+                "response": response_truncated,
+                "timestamp": timestamp,
+                **({"extra": json.dumps(metadata)} if metadata else {}),
+            }],
+            ids=[feedback_id],
+        )
+        logger.info(
+            "redis_store: ChromaDB add flow=%s decision=%s id=%s",
+            flow, human_decision, feedback_id,
+        )
+    except Exception as e:
+        logger.warning("redis_store: ChromaDB write failed: %s", e)
 
 logger = logging.getLogger(__name__)
 
@@ -113,5 +183,22 @@ def record_feedback(session_id: str, outcome: str, metadata: dict | None = None)
             outcome,
             list(metadata.keys()) if metadata else [],
         )
+
+        flow = data.get("flow", "unknown")
+        # To match DPO format, we need to extract something that looks like prompt/response
+        prompt_data = {k: v for k, v in data.items() if k not in ["model_output", "feedback", "feedback_at"]}
+        prompt_str = json.dumps(prompt_data)
+        response_str = json.dumps(data.get("model_output", data))
+
+        _write_chromadb(
+            flow=flow,
+            feedback_id=session_id,
+            prompt=prompt_str,
+            response=response_str,
+            human_decision=outcome,
+            timestamp=data["feedback_at"],
+            metadata=metadata
+        )
+
     except Exception as exc:
         logger.error("redis_store: record_feedback SET failed for %s: %s", session_id, exc)

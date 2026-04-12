@@ -23,5 +23,8 @@ email-validator
 # Redis session store
 redis[hiredis]
 
+# RLHF (ChromaDB for DPO storing)
+chromadb-client
+
 # Environment (local only — not needed in Lambda but harmless)
 python-dotenv
