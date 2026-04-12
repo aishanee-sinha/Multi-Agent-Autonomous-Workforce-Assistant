@@ -118,7 +118,7 @@ def slack_post_preview(state: OrchestratorState) -> OrchestratorState:
                     "type": "button",
                     "text": {"type": "plain_text", "text": "✅ Create Ticket"},
                     "style": "primary",
-                    "value": save_session({"s": state.slack_ticket_summary, "a": state.slack_ticket_assignee}),
+                    "value": save_session({"flow": "slack", "s": state.slack_ticket_summary, "a": state.slack_ticket_assignee}),
                     "action_id": "create_jira",
                 },
                 {
