@@ -1,0 +1,31 @@
+# Core LLM + Agent framework
+langchain-openai
+langchain-core
+langgraph
+
+# Slack
+slack-sdk
+
+# Jira
+requests
+
+# Google (Gmail + Calendar)
+google-auth
+google-auth-httplib2
+google-auth-oauthlib
+google-api-python-client
+python-dateutil
+
+# Data validation
+pydantic
+email-validator
+
+# Redis session store
+redis[hiredis]
+
+# RLHF (ChromaDB for DPO storing)
+numpy<2.0.0
+chromadb-client
+
+# Environment (local only — not needed in Lambda but harmless)
+python-dotenv
