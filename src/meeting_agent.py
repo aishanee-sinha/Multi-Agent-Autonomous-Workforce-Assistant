@@ -892,7 +892,7 @@ def meeting_post_slack(state: OrchestratorState) -> OrchestratorState:
             {
                 "type": "button", "style": "primary",
                 "text":      {"type": "plain_text", "text": "Confirm - Send Email"},
-                "value":     save_session({"file_name": file_name, "s3_key": s3_key}),
+                "value":     save_session({"flow": "meeting", "file_name": file_name, "s3_key": s3_key}),
                 "action_id": "confirm_summary",
             },
             {

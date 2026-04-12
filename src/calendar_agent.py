@@ -290,6 +290,7 @@ def email_post_slack_preview(state: OrchestratorState) -> OrchestratorState:
 
     # ── Save ONE session for this meeting with all proposed slots ─────────────
     session_payload = {
+        "flow": "calendar",
         "email_data": state.email_data,
         "meeting_title":    title,
         "meeting_location": state.meeting_location,
