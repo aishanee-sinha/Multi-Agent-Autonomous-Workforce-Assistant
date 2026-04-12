@@ -608,8 +608,10 @@ def _create_calendar_event(model_output: dict, original_email: dict) -> str:
             # Strip common malformed separators before the offset
             text = re.sub(r"([0-9])\s([+-]\d{2}:\d{2})$", r"\1\2", text)
             text = re.sub(r"([0-9])\s(\d{2}:\d{2})$",     r"\1+\2", text)
-            # Parse then replace (not convert) timezone with PDT
-            dt = dp(text).replace(tzinfo=PDT_TZ)
+            # Strip any timezone info the model may have included, then
+            # stamp PDT. We use replace(tzinfo=None) first to make the
+            # datetime naive, so there is no ambiguity about conversion.
+            dt = dp(text).replace(tzinfo=None).replace(tzinfo=PDT_TZ)
             return dt.isoformat()
 
         start_iso = _to_pdt(model_output.get("start_time"))

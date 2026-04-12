@@ -307,7 +307,8 @@ INCLUDE_EMAIL_SENDER = os.getenv("CALENDAR_INCLUDE_SENDER", "true").strip().lowe
     "1", "true", "yes", "y", "on"
 }
 
-LOCAL_TZ = datetime.now().astimezone().tzinfo
+PDT_TZ   = timezone(timedelta(hours=-7), name="PDT")
+LOCAL_TZ = PDT_TZ  # all times in this project are PDT
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -874,13 +875,15 @@ def slot_cod(state: OrchestratorState) -> OrchestratorState:
     #    fetch_min/fetch_max come directly from email_classify's start_window/end_window.
     #    If the window is missing (fallback), derive bounds from the search days.
     if email_context["start_window"] and email_context["end_window"]:
-        fetch_min = email_context["start_window"]
-        fetch_max = email_context["end_window"]
+        # Strip any existing tz info and stamp PDT — email_classify output is always PDT
+        from dateutil.parser import parse as _dp
+        fetch_min = _dp(email_context["start_window"]).replace(tzinfo=None).replace(tzinfo=PDT_TZ).isoformat()
+        fetch_max = _dp(email_context["end_window"]).replace(tzinfo=None).replace(tzinfo=PDT_TZ).isoformat()
     else:
         fetch_min = datetime(search_days[0].year,  search_days[0].month,  search_days[0].day,
-                             start_hour, 0, tzinfo=LOCAL_TZ).isoformat()
+                             start_hour, 0, tzinfo=PDT_TZ).isoformat()
         fetch_max = datetime(search_days[-1].year, search_days[-1].month, search_days[-1].day,
-                             end_hour, 0, tzinfo=LOCAL_TZ).isoformat()
+                             end_hour, 0, tzinfo=PDT_TZ).isoformat()
 
     logger.info("slot_cod: fetching calendars for search window  %s  ->  %s", fetch_min, fetch_max)
 
