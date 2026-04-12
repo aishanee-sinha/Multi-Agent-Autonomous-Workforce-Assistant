@@ -119,7 +119,14 @@ class OrchestratorState(BaseModel):
     calendar_link: Optional[str] = None
     pending_meeting: Optional[dict] = None
 
-    # ── Redis session ID — carried from parse_input to create/cancel nodes ─
+    # ── CoD top-3 slots — set by slot_cod, consumed by email_post_slack_preview ─
+    cod_top_slots: list[dict] = Field(default_factory=list)
+
+    # ── Selected slot — set by parse_input when a slot button is clicked ──────
+    selected_slot: Optional[dict] = None
+
+    # ── Redis session IDs — carried from parse_input to create/cancel nodes ───
+    # For email flow: comma-joined string of up to 3 session IDs (one per slot)
     session_id: Optional[str] = None
 
     # ── Meeting Transcript-specific (added) ───────────────────────────────
