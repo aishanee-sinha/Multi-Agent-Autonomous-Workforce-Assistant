@@ -37,6 +37,10 @@ GROUP_EMAILS = json.loads(os.environ.get("GROUP_EMAILS_JSON", "[]"))
 GOOGLE_TOKEN = os.environ.get("GOOGLE_TOKEN_JSON", "")
 CALENDAR_TOKENS: dict = json.loads(os.environ.get("CALENDAR_TOKENS_JSON", "{}"))
 
+# ── Redis session store ────────────────────────────────────────────────────────
+REDIS_URL           = os.environ.get("REDIS_URL", "redis://localhost:6379")
+SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", "3600"))
+
 # ── Meeting Summarizer env vars (added) ───────────────────────────────────────
 SES_FROM_EMAIL     = os.environ.get("SES_FROM_EMAIL", "")
 PARTICIPANT_EMAILS = [

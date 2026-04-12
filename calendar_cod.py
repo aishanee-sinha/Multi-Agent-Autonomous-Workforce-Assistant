@@ -32,6 +32,8 @@ from dotenv import load_dotenv
 # Must load env before importing state.py — it reads EC2_IP at module level
 load_dotenv()
 
+from redis_store import load_session
+
 from pydantic import BaseModel, Field
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, START, END
@@ -108,8 +110,15 @@ def parse_input(state: OrchestratorState) -> OrchestratorState:
         action      = payload["actions"][0]
         action_id   = action["action_id"]
         logger.info("[trace=%s] parse_input interactivity action_id=%s", trace_id, action_id)
-        raw_value  = urllib.parse.unquote_plus(action.get("value", "{}"))
-        value_dict = json.loads(raw_value) if raw_value and raw_value != "{}" else {}
+        raw_value  = urllib.parse.unquote_plus(action.get("value", ""))
+        # Button values are now Redis session IDs (UUID strings).
+        # "cancel" is a sentinel for cancel buttons which carry no payload.
+        if raw_value and raw_value not in ("", "cancel", "{}"):
+            value_dict = load_session(raw_value) or {}
+            if not value_dict:
+                logger.warning("[trace=%s] session %s expired or missing", trace_id, raw_value)
+        else:
+            value_dict = {}
 
         # ── Meeting summarizer Confirm / Cancel buttons ─────────────────────
         if action_id in ("confirm_summary", "cancel_summary"):

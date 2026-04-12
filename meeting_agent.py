@@ -31,6 +31,7 @@ Stateless button design (same pattern as calendar_agent):
 
 import io
 import json
+from redis_store import save_session
 import logging
 import os
 import re
@@ -891,7 +892,7 @@ def meeting_post_slack(state: OrchestratorState) -> OrchestratorState:
             {
                 "type": "button", "style": "primary",
                 "text":      {"type": "plain_text", "text": "Confirm - Send Email"},
-                "value":     json.dumps({"file_name": file_name, "s3_key": s3_key}),
+                "value":     save_session({"file_name": file_name, "s3_key": s3_key}),
                 "action_id": "confirm_summary",
             },
             {

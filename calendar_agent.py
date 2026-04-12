@@ -19,6 +19,7 @@ Routing within subgraph:
 """
 
 import base64, json, logging, re
+from redis_store import save_session
 from datetime import datetime, timezone, timedelta
 from typing import Literal
 from pydantic import BaseModel, EmailStr, EmailStr, Field
@@ -289,6 +290,7 @@ def email_post_slack_preview(state: OrchestratorState) -> OrchestratorState:
             "time_confidence": state.time_confidence,
         }
     }
+    session_id = save_session(pending)
 
     title     = state.meeting_title or "Meeting"
     start     = state.meeting_start or "TBD"
@@ -320,14 +322,14 @@ def email_post_slack_preview(state: OrchestratorState) -> OrchestratorState:
                     "type": "button",
                     "text": {"type": "plain_text", "text": "✅ Create Meeting"},
                     "style": "primary",
-                    "value": json.dumps(pending),
+                    "value": session_id,
                     "action_id": "create_meeting",
                 },
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "❌ Cancel"},
                     "style": "danger",
-                    "value": "{}",
+                    "value": "cancel",
                     "action_id": "cancel_meeting",
                 },
             ],

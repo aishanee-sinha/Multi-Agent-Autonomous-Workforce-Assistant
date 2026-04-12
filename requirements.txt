@@ -20,5 +20,8 @@ python-dateutil
 pydantic
 email-validator
 
+# Redis session store
+redis[hiredis]
+
 # Environment (local only — not needed in Lambda but harmless)
 python-dotenv
