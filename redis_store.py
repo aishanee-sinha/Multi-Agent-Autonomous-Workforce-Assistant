@@ -68,7 +68,9 @@ def load_session(session_id: str) -> dict | None:
         return None
 
     try:
-        return json.loads(raw)
+        data = json.loads(raw)
+        logger.info("redis_store: loaded session %s keys=%s", session_id, list(data.keys()))
+        return data
     except json.JSONDecodeError as exc:
         logger.error("redis_store: could not decode session %s: %s", session_id, exc)
         return None
