@@ -134,12 +134,30 @@ def parse_input(state: OrchestratorState) -> OrchestratorState:
                 "preview_ts":         payload["container"]["message_ts"],
             })
 
-        if action_id in ("create_meeting", "cancel_meeting"):
+        # ── Slot selection buttons (email CoD flow) ────────────────────────
+        if action_id in ("select_slot_0", "select_slot_1", "select_slot_2"):
+            logger.info("[trace=%s] -> email slot selected (action_id=%s)", trace_id, action_id)
+            # value_dict contains the selected slot's pending payload.
+            # session_id is that specific slot's Redis key.
+            # all_session_ids (comma-joined) is stored inside value_dict for cancel cleanup.
             return state.model_copy(update={
                 "intent":           "email",
                 "slack_event_type": "interactivity",
-                "slack_action_id":  action_id,
-                "pending_meeting":  value_dict if action_id == "create_meeting" else None,
+                "slack_action_id":  "create_meeting",  # reuse existing create path
+                "pending_meeting":  value_dict,
+                "selected_slot":    value_dict.get("model_output"),
+                "session_id":       session_id,
+                "channel_id":       payload["channel"]["id"],
+                "preview_ts":       payload["container"]["message_ts"],
+            })
+
+        if action_id == "cancel_meeting":
+            # session_id here is a comma-joined string of all slot session IDs
+            return state.model_copy(update={
+                "intent":           "email",
+                "slack_event_type": "interactivity",
+                "slack_action_id":  "cancel_meeting",
+                "pending_meeting":  None,
                 "session_id":       session_id,
                 "channel_id":       payload["channel"]["id"],
                 "preview_ts":       payload["container"]["message_ts"],
@@ -335,14 +353,17 @@ class SlotChallenge(BaseModel):
     )
 
 
+class RankedSlot(BaseModel):
+    start: str = Field(description="ISO 8601 datetime for the slot start")
+    end:   str = Field(description="ISO 8601 datetime for the slot end (1 hour after start)")
+    reason: str = Field(description="One sentence rationale for this slot's rank")
+
+
 class SlotVerdict(BaseModel):
-    final_slot_start: str = Field(
-        description="ISO 8601 datetime for the final agreed start time"
+    top_slots: list[RankedSlot] = Field(
+        description="Exactly 3 best slots ranked from best (#1) to third-best (#3). "
+                    "Each must appear in the candidate list."
     )
-    final_slot_end: str = Field(
-        description="ISO 8601 datetime for the final agreed end time (1 hour after start)"
-    )
-    reason: str = Field(description="One sentence rationale for the choice")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -751,17 +772,18 @@ def _run_cod(
                 "You are the Judge in a meeting scheduling debate.\n"
                 "You are given the original email intent, calendar availability, "
                 "and both the Proposer's and Challenger's arguments.\n\n"
-                "Your job: make the final decision. Rules:\n"
-                "  1. The slot MUST appear in the candidate list — never invent a time\n"
-                "  2. The slot MUST honour any time constraints from the email "
+                "Your job: pick the TOP 3 best slots from the candidate list, ranked best to third-best.\n"
+                "Rules:\n"
+                "  1. Every slot MUST appear in the candidate list — never invent a time\n"
+                "  2. Every slot MUST honour any time constraints from the email "
                 "(e.g. 'morning', 'before 2pm')\n"
                 "  3. Strongly prefer [ALL FREE] slots over conflict slots\n"
                 "  4. Among conflict slots, only accept NON-URGENT/displaceable ones\n"
                 "  5. Prefer earlier days and mid-morning when comparing across the week\n"
-                "Return a SlotVerdict with:\n"
-                "  - final_slot_start: ISO 8601 datetime from the candidate list\n"
-                "  - final_slot_end: exactly 1 hour after final_slot_start, ISO 8601\n"
-                "  - reason: one sentence explaining why this slot best fits the email intent"
+                "  6. If fewer than 3 candidate slots exist, return as many as are available\n"
+                "Return a SlotVerdict with top_slots: a list of up to 3 RankedSlot objects.\n"
+                "Each RankedSlot has: start (ISO 8601), end (1 hour after start, ISO 8601), "
+                "reason (one sentence)."
             )),
             HumanMessage(content=(
                 f"{context}\n\n"
@@ -772,7 +794,8 @@ def _run_cod(
                 f"Challenger argument: {challenge.argument}"
             )),
         ])
-        logger.info("slot_cod verdict: %s | %s", verdict.final_slot_start, verdict.reason)
+        for i, s in enumerate(verdict.top_slots):
+            logger.info("slot_cod verdict #%d: %s | %s", i + 1, s.start, s.reason)
         return verdict
 
     except Exception as e:
@@ -829,8 +852,8 @@ def slot_cod(state: OrchestratorState) -> OrchestratorState:
     # 2. Load participant tokens
     access_tokens = _load_participant_tokens(state)
     if not access_tokens:
-        logger.warning("slot_cod: no tokens loaded — clearing email-extracted time, CoD required")
-        return state.model_copy(update={"meeting_start": None, "meeting_end": None})
+        logger.warning("slot_cod: no tokens loaded — cod_top_slots set to []")
+        return state.model_copy(update={"cod_top_slots": []})
 
     # 3. Fetch events for the FULL search window in one API call per participant.
     #    fetch_min/fetch_max come directly from email_classify's start_window/end_window.
@@ -859,8 +882,8 @@ def slot_cod(state: OrchestratorState) -> OrchestratorState:
             logger.warning("slot_cod: events fetch failed for %s: %s", name, e)
 
     if not all_window_events:
-        logger.warning("slot_cod: no events fetched — clearing times")
-        return state.model_copy(update={"meeting_start": None, "meeting_end": None})
+        logger.warning("slot_cod: no events fetched — cod_top_slots set to []")
+        return state.model_copy(update={"cod_top_slots": []})
 
     # 4. Analyse slots day by day — filter the pre-fetched window events to each day
     all_free_slots:    list[dict] = []
@@ -901,23 +924,21 @@ def slot_cod(state: OrchestratorState) -> OrchestratorState:
             )
 
     else:
-        logger.info("slot_cod: no viable slots found — meeting_start/end set to None (TBD)")
-        return state.model_copy(update={"meeting_start": None, "meeting_end": None})
+        logger.info("slot_cod: no viable slots found — cod_top_slots set to []")
+        return state.model_copy(update={"cod_top_slots": []})
 
     # 5. Run Chain-of-Debate
     verdict = _run_cod(candidate_slots, list(access_tokens.keys()), search_label, email_context)
-    if not verdict:
-        logger.warning("slot_cod: CoD returned no verdict — meeting_start/end set to None (TBD)")
-        return state.model_copy(update={"meeting_start": None, "meeting_end": None})
+    if not verdict or not verdict.top_slots:
+        logger.warning("slot_cod: CoD returned no verdict — cod_top_slots set to []")
+        return state.model_copy(update={"cod_top_slots": []})
 
-    logger.info(
-        "slot_cod: CoD judge set meeting time -> %s to %s  (%s)",
-        verdict.final_slot_start, verdict.final_slot_end, verdict.reason,
-    )
-    return state.model_copy(update={
-        "meeting_start": verdict.final_slot_start,
-        "meeting_end":   verdict.final_slot_end,
-    })
+    top_slots = [
+        {"start": s.start, "end": s.end, "reason": s.reason}
+        for s in verdict.top_slots[:3]
+    ]
+    logger.info("slot_cod: CoD judge returned %d ranked slot(s)", len(top_slots))
+    return state.model_copy(update={"cod_top_slots": top_slots})
 
 
 # ─────────────────────────────────────────────────────────────────────────────

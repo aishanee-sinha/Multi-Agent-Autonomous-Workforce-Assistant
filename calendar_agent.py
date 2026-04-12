@@ -271,76 +271,122 @@ def email_classify(state: OrchestratorState) -> OrchestratorState:
         return state.model_copy(update={"error": str(e), "is_meeting": False})
 
 
+def _format_slot_label(start_iso: str) -> str:
+    """Format a slot ISO datetime into a human-readable Slack button label."""
+    try:
+        from dateutil.parser import parse as dp
+        dt = dp(start_iso)
+        return dt.strftime("%a %b %-d, %-I:%M %p")
+    except Exception:
+        return start_iso
+
+
 def email_post_slack_preview(state: OrchestratorState) -> OrchestratorState:
     """
-    Post a Slack card with ✅ Create Meeting / ❌ Cancel buttons.
-    The full pending_meeting dict is embedded in the button value
-    so Lambda can reconstruct it on the next invocation — no DynamoDB needed.
+    Post a Slack card with up to 3 CoD-ranked slot buttons + ❌ Cancel.
+
+    Each slot button stores its own Redis session ID. The Cancel button
+    stores a comma-joined string of all slot session IDs so every proposal
+    can be marked rejected in one click.
+
+    Falls back to a single TBD card when CoD produced no slots.
     """
     client = _logged_slack(WebClient(token=SLACK_BOT_TOKEN))
 
-    pending = {
-        "email_data": state.email_data,
-        "model_output": {
-            "title":           state.meeting_title,
-            "start_time":      state.meeting_start,
-            "end_time":        state.meeting_end,
-            "location":        state.meeting_location,
-            "attendees":       state.meeting_attendees,
-            "time_confidence": state.time_confidence,
-        }
-    }
-    session_id = save_session(pending)
-
     title     = state.meeting_title or "Meeting"
-    start     = state.meeting_start or "TBD"
-    end       = state.meeting_end   or "TBD"
     location  = state.meeting_location or "N/A"
     attendees = ", ".join(state.meeting_attendees[:3]) or "N/A"
-    confidence = state.time_confidence or "none"
 
-    blocks = [
+    top_slots = state.cod_top_slots  # list of {start, end, reason}
+
+    # ── Save one Redis session per slot ───────────────────────────────────────
+    all_session_ids: list[str] = []
+    for slot in top_slots:
+        pending = {
+            "email_data": state.email_data,
+            "model_output": {
+                "title":           title,
+                "start_time":      slot["start"],
+                "end_time":        slot["end"],
+                "location":        state.meeting_location,
+                "attendees":       state.meeting_attendees,
+                "time_confidence": state.time_confidence,
+            },
+            "all_proposed_slots": [
+                {"start": s["start"], "end": s["end"]} for s in top_slots
+            ],
+            "slot_rank": len(all_session_ids) + 1,
+        }
+        sid = save_session(pending)
+        all_session_ids.append(sid)
+        logger.info(
+            "email_post_slack_preview: saved slot #%d session=%s start=%s",
+            len(all_session_ids), sid, slot["start"],
+        )
+
+    # Cancel button value = comma-joined all session IDs for bulk rejection
+    cancel_value = ",".join(all_session_ids) if all_session_ids else "cancel"
+
+    # ── Build Slack blocks ────────────────────────────────────────────────────
+    header_text = (
+        f"📧 *Meeting detected in incoming email*\n"
+        f"*Title:*     {title}\n"
+        f"*Location:*  {location}\n"
+        f"*Attendees:* {attendees}\n"
+    )
+
+    if top_slots:
+        header_text += "\n*CoD proposed the following slots — pick one:*"
+    else:
+        header_text += "\n⚠️ *No available slots found — please schedule manually.*"
+
+    blocks: list[dict] = [
         {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": header_text},
+        }
+    ]
+
+    # One actions block per slot (Slack limits 5 elements per actions block)
+    slot_action_ids = ["select_slot_0", "select_slot_1", "select_slot_2"]
+    for i, (slot, sid, action_id) in enumerate(
+        zip(top_slots, all_session_ids, slot_action_ids)
+    ):
+        label = _format_slot_label(slot["start"])
+        reason = slot.get("reason", "")
+        blocks.append({
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": (
-                    f"📧 *Meeting detected in incoming email*\n"
-                    f"*Title:*      {title}\n"
-                    f"*Start:*      {start}\n"
-                    f"*End:*        {end}\n"
-                    f"*Location:*   {location}\n"
-                    f"*Attendees:*  {attendees}\n"
-                    f"*Confidence:* {confidence}"
-                ),
+                "text": f"*#{i+1}* — {label}  _{reason}_",
             },
-        },
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "✅ Create Meeting"},
-                    "style": "primary",
-                    "value": session_id,
-                    "action_id": "create_meeting",
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "❌ Cancel"},
-                    "style": "danger",
-                    "value": "cancel",
-                    "action_id": "cancel_meeting",
-                },
-            ],
-        },
-    ]
+            "accessory": {
+                "type": "button",
+                "text": {"type": "plain_text", "text": f"✅ Slot {i+1}"},
+                "style": "primary",
+                "value": sid,
+                "action_id": action_id,
+            },
+        })
+
+    blocks.append({
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "❌ Cancel"},
+                "style": "danger",
+                "value": cancel_value,
+                "action_id": "cancel_meeting",
+            }
+        ],
+    })
 
     try:
         resp = client.chat_postMessage(
             channel=SLACK_NOTIFY_CHANNEL,
             blocks=blocks,
-            text=f"Meeting detected: {title}",
+            text=f"Meeting detected: {title} — pick a slot",
         )
         return state.model_copy(update={"preview_ts": resp["ts"]})
     except SlackApiError as e:
@@ -366,15 +412,17 @@ def email_create_calendar(state: OrchestratorState) -> OrchestratorState:
 
     link = _create_calendar_event(model_output, original_email)
 
-    # Record human feedback in Redis
+    # Record human feedback in Redis for the selected slot session
     if state.session_id:
         if link:
-            record_feedback(state.session_id, "accepted", {
-                "calendar_link":    link,
-                "meeting_title":    model_output.get("title"),
-                "meeting_start":    model_output.get("start_time"),
-                "meeting_end":      model_output.get("end_time"),
-                "meeting_attendees": model_output.get("attendees", []),
+            record_feedback(state.session_id, "selected", {
+                "calendar_link":      link,
+                "meeting_title":      model_output.get("title"),
+                "meeting_start":      model_output.get("start_time"),
+                "meeting_end":        model_output.get("end_time"),
+                "meeting_attendees":  model_output.get("attendees", []),
+                "slot_rank":          pending.get("slot_rank"),
+                "all_proposed_slots": pending.get("all_proposed_slots", []),
             })
         else:
             record_feedback(state.session_id, "failed", {"reason": "calendar_create_error"})
@@ -411,9 +459,13 @@ def email_create_calendar(state: OrchestratorState) -> OrchestratorState:
 
 
 def email_post_cancel(state: OrchestratorState) -> OrchestratorState:
-    """User clicked ❌ Cancel — update the Slack card."""
+    """User clicked ❌ Cancel — mark all proposed slot sessions rejected."""
     if state.session_id:
-        record_feedback(state.session_id, "rejected")
+        # session_id is a comma-joined list of all slot session IDs
+        for sid in state.session_id.split(","):
+            sid = sid.strip()
+            if sid:
+                record_feedback(sid, "rejected")
 
     client = _logged_slack(WebClient(token=SLACK_BOT_TOKEN))
     try:
