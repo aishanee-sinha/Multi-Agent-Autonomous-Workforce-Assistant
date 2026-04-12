@@ -285,47 +285,37 @@ def email_post_slack_preview(state: OrchestratorState) -> OrchestratorState:
     """
     Post a Slack card with up to 3 CoD-ranked slot buttons + ❌ Cancel.
 
-    Each slot button stores its own Redis session ID. The Cancel button
-    stores a comma-joined string of all slot session IDs so every proposal
-    can be marked rejected in one click.
+    A single Redis session is saved for the whole meeting, containing all
+    proposed slots. Every button (slot and cancel) shares the same session_id.
+    parse_input uses the action_id (select_slot_0/1/2) to know which slot
+    was chosen and updates the session accordingly.
 
-    Falls back to a single TBD card when CoD produced no slots.
+    Falls back to a no-slots card when CoD produced nothing.
     """
     client = _logged_slack(WebClient(token=SLACK_BOT_TOKEN))
 
     title     = state.meeting_title or "Meeting"
     location  = state.meeting_location or "N/A"
     attendees = ", ".join(state.meeting_attendees[:3]) or "N/A"
-
     top_slots = state.cod_top_slots  # list of {start, end, reason}
 
-    # ── Save one Redis session per slot ───────────────────────────────────────
-    all_session_ids: list[str] = []
-    for slot in top_slots:
-        pending = {
-            "email_data": state.email_data,
-            "model_output": {
-                "title":           title,
-                "start_time":      slot["start"],
-                "end_time":        slot["end"],
-                "location":        state.meeting_location,
-                "attendees":       state.meeting_attendees,
-                "time_confidence": state.time_confidence,
-            },
-            "all_proposed_slots": [
-                {"start": s["start"], "end": s["end"]} for s in top_slots
-            ],
-            "slot_rank": len(all_session_ids) + 1,
-        }
-        sid = save_session(pending)
-        all_session_ids.append(sid)
-        logger.info(
-            "email_post_slack_preview: saved slot #%d session=%s start=%s",
-            len(all_session_ids), sid, slot["start"],
-        )
-
-    # Cancel button value = comma-joined all session IDs for bulk rejection
-    cancel_value = ",".join(all_session_ids) if all_session_ids else "cancel"
+    # ── Save ONE session for this meeting with all proposed slots ─────────────
+    session_payload = {
+        "email_data": state.email_data,
+        "meeting_title":    title,
+        "meeting_location": state.meeting_location,
+        "meeting_attendees": state.meeting_attendees,
+        "time_confidence":  state.time_confidence,
+        "all_proposed_slots": [
+            {"start": s["start"], "end": s["end"], "reason": s.get("reason", "")}
+            for s in top_slots
+        ],
+    }
+    session_id = save_session(session_payload)
+    logger.info(
+        "email_post_slack_preview: saved session=%s with %d proposed slot(s)",
+        session_id, len(top_slots),
+    )
 
     # ── Build Slack blocks ────────────────────────────────────────────────────
     header_text = (
@@ -334,25 +324,18 @@ def email_post_slack_preview(state: OrchestratorState) -> OrchestratorState:
         f"*Location:*  {location}\n"
         f"*Attendees:* {attendees}\n"
     )
-
     if top_slots:
         header_text += "\n*CoD proposed the following slots — pick one:*"
     else:
         header_text += "\n⚠️ *No available slots found — please schedule manually.*"
 
     blocks: list[dict] = [
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": header_text},
-        }
+        {"type": "section", "text": {"type": "mrkdwn", "text": header_text}}
     ]
 
-    # One actions block per slot (Slack limits 5 elements per actions block)
     slot_action_ids = ["select_slot_0", "select_slot_1", "select_slot_2"]
-    for i, (slot, sid, action_id) in enumerate(
-        zip(top_slots, all_session_ids, slot_action_ids)
-    ):
-        label = _format_slot_label(slot["start"])
+    for i, (slot, action_id) in enumerate(zip(top_slots, slot_action_ids)):
+        label  = _format_slot_label(slot["start"])
         reason = slot.get("reason", "")
         blocks.append({
             "type": "section",
@@ -361,25 +344,23 @@ def email_post_slack_preview(state: OrchestratorState) -> OrchestratorState:
                 "text": f"*#{i+1}* — {label}  _{reason}_",
             },
             "accessory": {
-                "type": "button",
-                "text": {"type": "plain_text", "text": f"✅ Slot {i+1}"},
-                "style": "primary",
-                "value": sid,
+                "type":      "button",
+                "text":      {"type": "plain_text", "text": f"✅ Slot {i+1}"},
+                "style":     "primary",
+                "value":     session_id,   # same session for all slot buttons
                 "action_id": action_id,
             },
         })
 
     blocks.append({
         "type": "actions",
-        "elements": [
-            {
-                "type": "button",
-                "text": {"type": "plain_text", "text": "❌ Cancel"},
-                "style": "danger",
-                "value": cancel_value,
-                "action_id": "cancel_meeting",
-            }
-        ],
+        "elements": [{
+            "type":      "button",
+            "text":      {"type": "plain_text", "text": "❌ Cancel"},
+            "style":     "danger",
+            "value":     session_id,       # same session for cancel too
+            "action_id": "cancel_meeting",
+        }],
     })
 
     try:
@@ -412,17 +393,14 @@ def email_create_calendar(state: OrchestratorState) -> OrchestratorState:
 
     link = _create_calendar_event(model_output, original_email)
 
-    # Record human feedback in Redis for the selected slot session
+    # Record human feedback — updates the single meeting session in Redis
     if state.session_id:
         if link:
             record_feedback(state.session_id, "selected", {
-                "calendar_link":      link,
-                "meeting_title":      model_output.get("title"),
-                "meeting_start":      model_output.get("start_time"),
-                "meeting_end":        model_output.get("end_time"),
-                "meeting_attendees":  model_output.get("attendees", []),
-                "slot_rank":          pending.get("slot_rank"),
-                "all_proposed_slots": pending.get("all_proposed_slots", []),
+                "calendar_link":       link,
+                "selected_slot_index": pending.get("selected_slot_index"),
+                "meeting_start":       model_output.get("start_time"),
+                "meeting_end":         model_output.get("end_time"),
             })
         else:
             record_feedback(state.session_id, "failed", {"reason": "calendar_create_error"})
@@ -459,13 +437,9 @@ def email_create_calendar(state: OrchestratorState) -> OrchestratorState:
 
 
 def email_post_cancel(state: OrchestratorState) -> OrchestratorState:
-    """User clicked ❌ Cancel — mark all proposed slot sessions rejected."""
+    """User clicked ❌ Cancel — mark the meeting session as rejected."""
     if state.session_id:
-        # session_id is a comma-joined list of all slot session IDs
-        for sid in state.session_id.split(","):
-            sid = sid.strip()
-            if sid:
-                record_feedback(sid, "rejected")
+        record_feedback(state.session_id, "rejected")
 
     client = _logged_slack(WebClient(token=SLACK_BOT_TOKEN))
     try:
