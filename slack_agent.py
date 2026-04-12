@@ -17,6 +17,7 @@ Entry routing (route_slack_entry):
 """
 
 import json, logging
+from redis_store import save_session
 
 import requests
 from requests.auth import HTTPBasicAuth
@@ -117,7 +118,7 @@ def slack_post_preview(state: OrchestratorState) -> OrchestratorState:
                     "type": "button",
                     "text": {"type": "plain_text", "text": "✅ Create Ticket"},
                     "style": "primary",
-                    "value": json.dumps({"s": state.slack_ticket_summary, "a": state.slack_ticket_assignee}),
+                    "value": save_session({"s": state.slack_ticket_summary, "a": state.slack_ticket_assignee}),
                     "action_id": "create_jira",
                 },
                 {
