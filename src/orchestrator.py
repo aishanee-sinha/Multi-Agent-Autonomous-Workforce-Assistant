@@ -23,7 +23,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from state import OrchestratorState, _llm, WEBHOOK_SECRET
 
 from slack_agent import build_slack_subgraph
-from calendar_agent import build_calendar_subgraph_cod
+from calendar_cod import build_calendar_subgraph_cod
 from meeting_agent import build_meeting_subgraph
 
 logger = logging.getLogger(__name__)
