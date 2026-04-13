@@ -1,139 +1,98 @@
-# Slack-Jira integration
+# Multi-Agent Autonomous Workforce Assistant (Chain-of-Debate)
 
-## Overview
-The Multi-Agent Autonomous Workforce Assistant is a project designed to streamline task management by integrating Slack messages with Jira issue tracking. This system utilizes natural language processing (NLP) techniques to extract actionable items from Slack conversations and create or update Jira tickets accordingly.
+A production-ready, multi-agent workplace automation system featuring **Human-in-the-loop** (HITL) task execution and **RLHF telemetry** powered by a self-hosted Qwen-2.5 14B model.
 
-## Project Structure
-- **DataPreprocessing.ipynb**: This notebook handles the preprocessing of Slack message data, including parsing XML files and cleaning the text for further analysis.
-- **DataLabeling.ipynb**: This notebook uses the Gemini model to label Slack messages with task-related information, such as task summaries, assignees, and issue creation dates.
-- **FinetuneLLM.ipynb**: This notebook is responsible for fine-tuning a language model (QLoRA) to extract task-related information from Slack messages and format it for Jira.
-- **Requirements**: The project requires several Python packages, including `pandas`, `transformers`, `sentence-transformers`, `requests`, and others specified in the notebooks.
+- **Slack → Jira**: Extract tasks from conversations, propose a ticket for approval, and create it on Jira.
+- **Email → Google Calendar**: Detect meeting intent from Gmail, propose slots in Slack, and book the event.
+- **Meeting Summarizer**: Automatically process meeting transcripts into summaries and action items.
 
-## Installation
-To set up the project, ensure you have Python installed, then install the required packages using pip:
+---
 
+## 🏛️ Deployment Architecture
+
+This project is built for **scale and statelessness** using a hybrid cloud architecture:
+
+1.  **AWS Lambda (The Orchestrator)**: Runs the LangGraph agent logic using a containerized Python 3.11 environment.
+2.  **AWS EC2 (The Brain)**: A GPU-backed instance running:
+    - **vLLM Engine (Port 8000)**: Serves the Qwen-2.5 model with custom LoRA adapters.
+    - **ChromaDB (Port 8001)**: A vector database for RLHF telemetry and RAG-based prompt injection.
+3.  **Upstash Redis (The Memory)**: Manages short-term session state to bypass Slack's 3KB interactive payload limit.
+
+---
+
+## 📁 Repository Structure
+
+```text
+.
+├── src/                    # Core Production Code
+│   ├── orchestrator.py     # Lambda entrypoint & Graph routing
+│   ├── state.py            # Global Graph State & Config
+│   ├── slack_agent.py      # Jira Ticket Subgraph
+│   ├── calendar_agent.py   # Google Calendar Subgraph
+│   ├── meeting_agent.py    # Meeting Summarizer Subgraph
+│   ├── redis_store.py      # Session management & ChromaDB hooks
+│   └── rag_retriever.py    # RAG logic for RLHF injection
+├── rlhf/                   # Reinforcement Learning Pipeline
+│   ├── setup_chromadb.sh   # Spin up Vector DB on EC2
+│   ├── check_chroma_data.py # Utility to verify logging
+│   ├── train_dpo.py        # Offline Direct Preference Optimization
+│   └── build_preference_dataset.py
+├── DataProcessingModelTraining/ # R&D Notebooks
+│   ├── EmailCalendar/      # Notebooks for GCal model training
+│   ├── MeetingSummarizer/  # Notebooks for Summarization model
+│   └── Slack_Jira/         # Notebooks for Jira extraction model
+├── docs/                   # Detailed Runbooks & Architecture
+├── Dockerfile              # Lambda container definition
+└── requirements.txt        # Production dependencies
+```
+
+---
+
+## 🚀 Getting Started
+
+### 1. EC2 Backend Setup (The Brain)
+SSH into your GPU instance and start the two required services:
 ```bash
-pip install -r requirements.txt
+# Start ChromaDB (RLHF telemetry)
+bash rlhf/setup_chromadb.sh --bg
+
+# Start vLLM inference engine
+# (See docs/Runbook.md for the full vllm start command)
+```
+*Note: Ensure Port 8000 (vLLM) and Port 8001 (ChromaDB) are open in your EC2 Security Groups.*
+
+### 2. AWS Lambda Deployment (The Orchestration)
+Build and push the Docker image to your Amazon ECR repository:
+```bash
+docker build -t slack-jira-agent .
+# (Push to ECR and click "Deploy new image" in the AWS Lambda console)
 ```
 
-## Usage
-1. **Data Preprocessing**: Run the `DataPreprocessing.ipynb` notebook to parse Slack message XML files and save the cleaned messages to a CSV file.
-2. **Data Labeling**: Use the `DataLabeling.ipynb` notebook to label Slack messages with task-related information using the Gemini model. The labeled data will be saved for further processing.
-3. **Fine-tuning the Model**: Execute the `FinetuneLLM.ipynb` notebook to fine-tune the language model on the labeled data.
-4. **Creating/Updating Jira Issues**: Use the provided functions to create or update Jira issues based on Slack messages. Ensure that your Jira credentials and project details are set in the environment variables.
-
-## Environment Variables
-Set the following environment variables for Jira integration:
-- `JIRA_BASE_URL`: Your Jira instance URL (e.g., `https://your-domain.atlassian.net`)
-- `JIRA_EMAIL`: Your Jira account email
-- `JIRA_API_TOKEN`: Your Jira API token
-- `JIRA_PROJECT_KEY`: The key of the Jira project where issues will be created
-- `JIRA_ISSUE_TYPE`: The type of issue to create (e.g., Task, Bug)
-
-## Example
-To create a new Jira issue from a Slack message, use the following code snippet:
-
-```python
-slack_msg = {
-    "timestamp": "2025-11-02T08:14:27.439600",
-    "text": "<@User> Can you complete the task by tomorrow?"
-}
-
-new_key = create_issue(slack_msg)
-print("Created:", new_key)
-```
-
-## Getting started
-
-### Option A — Orchestration (AWS Lambda + EC2 vLLM)
-
-This path is for running the production system.
-
-1. **Start the vLLM server** (typically on a GPU EC2 instance) with your base model + LoRA adapters.
-    - The canonical command and adapter naming conventions are documented in `AWSOrchestration/Readme.MD` and `AWSOrchestration/Runbook.md`.
-
-2. **Build and deploy the Lambda container image**:
-    ```bash
-    cd AWSOrchestration
-    docker build -t slack-jira-agent .
-    ```
-    Then push to ECR and update the Lambda image (see `AWSOrchestration/Readme.MD`).
-
-3. **Configure Slack**:
-    - Set the Lambda function URL / API Gateway endpoint as Slack’s Request URL.
-    - Enable **Event Subscriptions** and **Interactivity**.
-
-4. **Configure Gmail → Pub/Sub → Lambda**:
-    - Create a Pub/Sub topic, connect it to Gmail watch, and route pushes to your Lambda.
-    - You can register the Gmail watch with:
-      ```bash
-      cd AWSOrchestration
-      python gmail_watcher.py
-      ```
-      (requires `GOOGLE_TOKEN_JSON` and `PUBSUB_TOPIC` env vars).
-
-### Option B — Notebooks (data labeling → fine-tuning → evaluation)
-
-This path is for reproducing training/evaluation runs (commonly in Google Colab).
-
-**Email → Calendar meeting extraction pipeline** (recommended order):
-1. `DataProcessingModelTraining/EmailCalendar/DataLabelling_Email.ipynb`
-2. `DataProcessingModelTraining/EmailCalendar/DataPreprocessing_Email.ipynb`
-3. `DataProcessingModelTraining/EmailCalendar/Finetuning_Email.ipynb`
-4. `DataProcessingModelTraining/EmailCalendar/Evaluation_Email.ipynb`
-
-Other tracks:
-- Meeting summarization: `DataProcessingModelTraining/MeetingSummarizer/README.md`
-- Slack → Jira extraction: `DataProcessingModelTraining/Slack_Jira/readme.md`
-
-## Configuration
-
-### Orchestration environment variables (Lambda)
-
-These are read in `AWSOrchestration/state.py` and used by `orchestrator.py`, `slack_agent.py`, and `calendar_agent.py`.
-
+### 3. Environment Variables
+Inject these variables into your Lambda function:
 | Variable | Required | Purpose |
-|---|---:|---|
-| `EC2_IP` | Yes | Public IP/host of the vLLM server (expects OpenAI-compatible `/v1` endpoints) |
-| `SLACK_BOT_TOKEN` | Yes | Slack bot token (`xoxb-...`) |
-| `SLACK_NOTIFY_CHANNEL` | Yes | Channel ID where meeting proposals are posted |
-| `JIRA_BASE_URL` | Yes | Jira base URL, e.g. `https://yourorg.atlassian.net` |
-| `JIRA_EMAIL` | Yes | Jira account email used for API auth |
-| `JIRA_API_TOKEN` | Yes | Jira API token |
-| `JIRA_PROJECT_KEY` | No | Defaults to `KAN` |
-| `JIRA_ISSUE_TYPE` | No | Defaults to `Task` |
-| `GOOGLE_TOKEN_JSON` | Yes | Serialized Google OAuth token JSON (used for Gmail fetch + Calendar) |
-| `GROUP_EMAILS_JSON` | No | JSON array allowlist of sender emails for calendar flow |
-| `TEAM_MAP_JSON` | No | JSON map: Slack name/id → Jira account id |
+|---|---|---|
+| `EC2_IP` | Yes | Public IP of your GPU server |
+| `REDIS_URL` | Yes | Your Upstash Redis connection string (`rediss://...`) |
+| `SLACK_BOT_TOKEN` | Yes | Slack App Bot OAuth Token |
+| `GOOGLE_TOKEN_JSON`| Yes | Serialized Google OAuth JSON for Calendar/Gmail |
+| `JIRA_API_TOKEN` | Yes | Jira REST API token |
 
-### Helper-script environment variables (local / ops)
+---
 
-| Variable | Required | Used by |
-|---|---:|---|
-| `PUBSUB_TOPIC` | Yes (for watch) | `AWSOrchestration/gmail_watcher.py` |
+## 📊 RLHF Pipeline
+The system natively records every user decision ("Approve" vs "Cancel") into ChromaDB. 
 
-### Notebook secrets (training)
+- **Monitor Telemetry**: Run `python3 rlhf/check_chroma_data.py` on your EC2.
+- **Train Adapters**: Once enough data is collected, use the scripts in `rlhf/` to build a DPO dataset and fine-tune your model to improve its future suggestions.
 
-The notebooks generally assume execution in Colab and may use:
+---
 
-- `GEMINI_API_KEY` (for automated labeling)
-- `HF_TOKEN` (for pulling gated models/checkpoints)
-
-## Evaluation notes
-
-Evaluation for meeting extraction includes:
-
-- **JSON validity** (parseable structured output)
-- **Meeting detection** confusion matrix (precision/recall/F1)
-- **Field-level extraction** accuracy (title, attendees, start/end time, location, time_confidence)
-
-See `DataProcessingModelTraining/EmailCalendar/Evaluation_Email.ipynb` for the exact metrics code and reporting.
-
-## Docs
-
-- `AWSOrchestration/Readme.MD` — architecture + deployment details
-- `AWSOrchestration/Runbook.md` — operational commands and troubleshooting
-- `AWSOrchestration/Meeting_Summarizer/README.md` — meeting summarizer tooling
+## 📚 Detailed Documentation
+- [Architecture Deep-Dive](docs/Readme.MD)
+- [Operational Runbook (Ops)](docs/Runbook.md)
+- [RLHF Next Steps](NEXT_STEPS.md)
+zer/README.md` — meeting summarizer tooling
 - `DataProcessingModelTraining/MeetingSummarizer/README.md` — summarizer training/eval notes
 - `DataProcessingModelTraining/Slack_Jira/readme.md` — Slack/Jira labeling + training
 
