@@ -18,5 +18,8 @@ RUN pip install --upgrade pip && \
 # Copy all source files
 COPY src/ ${LAMBDA_TASK_ROOT}/
 
+# Force all python caching and homedir resolutions to /tmp
+ENV HOME="/tmp"
+
 # Lambda handler entrypoint
 CMD ["orchestrator.sqs_handler"]
