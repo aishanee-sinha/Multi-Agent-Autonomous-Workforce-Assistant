@@ -26,7 +26,7 @@ redis[hiredis]
 # RLHF (ChromaDB for DPO storing)
 numpy<2.0.0
 chromadb-client
-onnxruntime
+onnxruntime==1.15.1
 tokenizers
 
 # Environment (local only — not needed in Lambda but harmless)
