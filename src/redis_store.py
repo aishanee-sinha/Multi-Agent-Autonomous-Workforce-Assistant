@@ -40,6 +40,10 @@ def _get_chromadb():
     global _chroma_client
     if _chroma_client is None:
         try:
+            # Force cache to /tmp to bypass AWS Lambda Read-Only file system
+            os.environ["HF_HOME"] = "/tmp/huggingface"
+            os.environ["CHROMA_CACHE_DIR"] = "/tmp/chroma"
+            
             import chromadb
             _chroma_client = chromadb.HttpClient(
                 host=CHROMADB_HOST,
