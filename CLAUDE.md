@@ -3,13 +3,14 @@
 ## Project Overview
 
 Multi-agent LangGraph orchestrator deployed as a pair of AWS Lambda functions. Receives events from
-Slack (messages + button clicks) and Gmail (Pub/Sub push) and routes them to one of two
+Slack (messages + button clicks) and Gmail (Pub/Sub push) and routes them to one of **three**
 human-in-the-loop flows:
 
 - **Slack flow** — extracts a task from a Slack message, proposes a Jira ticket, creates it on approval
 - **Email flow** — detects meeting intent in an email, finds the best free slot via Chain-of-Debate, proposes a Google Calendar event, creates it on approval
+- **Meeting flow** — downloads a meeting transcript from Google Drive, summarises it + triages action items via CoD, stores artifacts in S3, sends email via SES on approval
 
-Both flows post a Slack preview card with Approve/Cancel buttons before taking any action.
+All flows post a Slack preview card with Approve/Cancel buttons before taking any action.
 
 ---
 
@@ -34,7 +35,8 @@ Lambda Function URL
                               router_agent         Qwen LLM classifies unknown intent
                               [conditional edge]
                                    ├─ slack_subgraph    extract → preview → [approve] → create Jira
-                                   └─ calendar_subgraph fetch email → classify → CoD slot → preview → [approve] → create Calendar event
+                                   ├─ calendar_subgraph fetch email → classify → CoD slot → preview → [approve] → create Calendar event
+                                   └─ meeting_subgraph  fetch transcript → preprocess → summarise → CoD triage → artifacts → S3 → preview → [approve] → SES email
 ```
 
 ### Key Files
@@ -46,6 +48,8 @@ Lambda Function URL
 | `calendar_cod.py` | Worker Lambda — `parse_input`, `router_agent`, full graph assembly, CoD slot selection |
 | `slack_agent.py` | Slack → Jira subgraph nodes |
 | `calendar_agent.py` | Email → Calendar subgraph nodes + `email_classify` prompt (imported by `calendar_cod.py`) |
+| `meeting_agent.py` | Meeting transcript → summarise → CoD triage → S3 → SES subgraph |
+| `redis_store.py` | Redis session storage — replaces full JSON in button values with a UUID session_id |
 | `gmail_history.py` | SSM-backed Gmail historyId persistence |
 | `gmail_watcher.py` | One-time script to register Gmail Pub/Sub watch (re-run every 7 days) |
 
@@ -61,7 +65,7 @@ Lambda Function URL
 
 - **Inference:** Self-hosted vLLM on EC2, exposed at `http://$EC2_IP:8000/v1`
 - **Base model:** `Qwen/Qwen2.5-14B-Instruct-AWQ`
-- **LoRA adapters:** `slack` (Jira extraction), `email` (meeting classification)
+- **LoRA adapters:** `slack` (Jira extraction), `email` (meeting classification), `meeting` (transcript summarisation + triage)
 - **Client:** `ChatOpenAI` from `langchain-openai`, pointed at the EC2 endpoint
 - `_llm()` in `state.py` is the single factory — import `state.py` **after** `load_dotenv()`, because `EC2_IP` is read at module level
 
@@ -98,12 +102,64 @@ Inserted between `email_classify` and `email_post_slack_preview`:
 
 ---
 
+## Meeting Flow (Transcript → Summary → SES)
+
+`meeting_agent.py` is the third subgraph. Pipeline on new transcript trigger:
+
+1. **`meeting_fetch_transcript`** — Download from Google Drive; S3 idempotency lock prevents reprocessing
+2. **`meeting_preprocess`** — Clean/normalise transcript text
+3. **`meeting_summarize`** — Chunked vLLM inference (`CHUNK_SIZE=10000, CHUNK_OVERLAP=1000`) + merge-pass abstract
+4. **`meeting_triage_cod`** — CoD classifies each action item: Priority (Critical/High/Medium/Low) + risk + deadline assessment
+5. **`meeting_generate_artifacts`** — ICS calendar invite (UTC-corrected) + CSV of action items
+6. **`meeting_store_s3`** — All artifacts uploaded to S3 (`S3_BUCKET` / `S3_PREFIX`), sets `meeting_s3_key`
+7. **`meeting_post_slack`** — Block Kit card with colour-coded triage (🔴🟠🟡🟢) + Confirm/Cancel buttons
+
+On approval:
+- **`meeting_send_email`** — Fetches artifacts from S3, sends via AWS SES
+- **`meeting_post_cancel`** — Updates Slack card to dismissed
+
+### meeting CoD schemas
+
+Same 3-role Proposer → Challenger → Judge pattern as `slot_cod`:
+- `ActionPriorityProposal` → `PriorityChallenge` → `TriageVerdict`
+- Each action item is debated independently; Slack card shows the triage results before human approves
+
+---
+
+## Redis Session Store
+
+`redis_store.py` replaces embedding full JSON payloads in Slack button values (2000-char limit).
+
+| Function | Description |
+|---|---|
+| `save_session(data)` | Stores `data` as JSON in Redis under a UUID, returns the `session_id` |
+| `load_session(session_id)` | Fetches and deserialises; returns `None` if expired |
+| `record_feedback(session_id, outcome, metadata)` | Merges human decision (`accepted`/`rejected`/`failed`) into session; extends TTL to 7 days for RLHF retention |
+
+- Session TTL: `SESSION_TTL_SECONDS` (default 3600 s / 1 hour)
+- Feedback TTL: 7 days (`FEEDBACK_TTL_SECONDS`)
+- Connection: `REDIS_URL` env var (default `redis://localhost:6379`), lazy singleton `_get_client()`
+
+**Button value pattern with Redis:**
+```
+# Posting preview:
+session_id = save_session(pending_dict)
+button["value"] = session_id          # only UUID in button, not full JSON
+
+# On button click:
+data = load_session(session_id)       # retrieve full payload from Redis
+record_feedback(session_id, "accepted", {"calendar_link": "..."})
+```
+
+---
+
 ## Timezone Handling
 
 - All times use the **local system timezone**, derived at runtime via `datetime.now().astimezone()`
 - `LOCAL_TZ` in `calendar_cod.py` — used for all datetime construction and event time conversion
 - `_tz_offset` and `_tz_name` in `_build_email_system_prompt()` — injected into the LLM prompt so the model outputs datetimes with the correct local UTC offset
 - Slot labels use `cursor.strftime("%Z")` so the timezone abbreviation is dynamic
+- `meeting_agent.py` has a `TZ_OFFSETS` dict for ICS UTC correction (handles PDT, EST, IST, etc.)
 
 ---
 
@@ -160,6 +216,14 @@ the initial `historyId` into SSM. **Re-run every 7 days** (Gmail watches expire 
 | `JIRA_ISSUE_TYPE` | `state.py` | Default issue type |
 | `TEAM_MAP_JSON` | `state.py` | JSON mapping Slack user IDs → Jira account IDs |
 | `GROUP_EMAILS_JSON` | `state.py` | Email whitelist for meeting detection |
+| `REDIS_URL` | `state.py` | Redis connection URL (default: `redis://localhost:6379`) |
+| `SESSION_TTL_SECONDS` | `state.py` | Redis session TTL in seconds (default: `3600`) |
+| `S3_BUCKET` | `state.py` | S3 bucket for transcript artifacts (default: `qwen-lora-weights`) |
+| `S3_TRANSCRIPT_PREFIX` | `state.py` | S3 key prefix for transcript artifacts (default: `transcript_summarizer`) |
+| `VLLM_MODEL_NAME` | `state.py` | vLLM LoRA adapter name for meeting summarisation (default: `meeting`) |
+| `SES_FROM_EMAIL` | `state.py` | SES sender address for meeting summary emails |
+| `PARTICIPANT_EMAILS` | `state.py` | Comma-separated list of default meeting participant emails |
+| `CALENDAR_INCLUDE_SENDER` | `calendar_cod.py` | Include email sender in calendar fetch (default: `true`) |
 
 For local runs, these are loaded from a `.env` file via `python-dotenv`.
 
@@ -186,6 +250,20 @@ python test_ingest_pubsub.py
 python test_ingest_slack.py
 ```
 
+Test files in `tests/`:
+
+| Test file | What it covers |
+|---|---|
+| `test_calendar_agent_local.py` | Calendar agent nodes end-to-end |
+| `test_cod_email_flow.py` | Full CoD email → calendar flow |
+| `test_cod_scheduler.py` | `slot_cod` slot selection logic |
+| `test_email_classify.py` | `email_classify` LLM node |
+| `test_orchestrator_local.py` | Full orchestrator graph |
+| `test_pubsub.py` | Gmail Pub/Sub ingest path |
+| `test_redis.py` | `redis_store` save/load/feedback |
+| `test_slack_post_preview.py` | Slack preview card posting |
+| `test_sqs_read.py` | SQS record unwrapping |
+
 ---
 
 ## Deployment
@@ -211,18 +289,15 @@ The Lambda Function URL (ingest only) is used for:
 
 ---
 
-## Stateless Design
+## Session / State Design
 
-No database. All button state is embedded in the Slack block's button `value` field as JSON:
+Button state is stored in **Redis** via `redis_store.py`. Only a UUID `session_id` is placed in
+the Slack button `value` field. On button click, `load_session(session_id)` retrieves the full
+payload. After the action completes, `record_feedback()` appends the human decision and extends
+the TTL to 7 days for RLHF retention.
 
-```json
-{
-  "email_data": { ... },
-  "model_output": { "title": "...", "start_time": "...", ... }
-}
-```
-
-On button click, `parse_input` deserializes this JSON back into state. No DynamoDB or Redis needed.
+> **Previous behaviour (removed):** Full JSON payload was embedded directly in the button value
+> field, which hit Slack's 2000-character limit for long emails.
 
 ---
 
