@@ -1,21 +1,31 @@
-*/.env
-package
+# Secrets
 .env
-**/.env
 **/client_secret.json
 **/google_token.json
+*.pem
+
+# Python
 __pycache__
 **/__pycache__
+*.pyc
+
+# OS
+.DS_Store
+
+# Data & Binary (Keep ignored)
 *.pptx
 *.docx
-*.md
-*.pem
-*.csv
 *.pdf
 *.log
 *.png
 *.jpg
-*.json
-*.txt
 *.zip
-*.ipynb
+
+# Only ignore specific data files, but allow project config/docs
+# (Removed broad *.md, *.json, *.txt ignores)
+# Add specific ignores if needed, e.g., slack_messages.csv
+*.csv
+chromadb_data/
+node_modules/
+dist/
+build/
