@@ -34,6 +34,11 @@ from state import (
     _llm,
 )
 
+import os as _os
+# URL of the meeting-agent Lambda — notified when a calendar event is created
+# so the consolidated email can be held until the calendar agent confirms.
+MEETING_LAMBDA_URL = _os.environ.get("MEETING_LAMBDA_URL", "")
+
 logger = logging.getLogger(__name__)
 
 PDT_TZ = timezone(timedelta(hours=-7), name="PDT")
@@ -423,7 +428,38 @@ def email_create_calendar(state: OrchestratorState) -> OrchestratorState:
     except SlackApiError as e:
         logger.error(f"Slack update error: {e}")
 
+    # Notify meeting agent that calendar is done so it can release consolidated email
+    s3_key = (state.email_data or {}).get("s3_key", "") if state.email_data else ""
+    _notify_meeting_agent_calendar_done(s3_key=s3_key, calendar_link=link or "")
+
     return state.model_copy(update={"calendar_link": link})
+
+
+def _notify_meeting_agent_calendar_done(s3_key: str, calendar_link: str) -> None:
+    """
+    POST a lightweight webhook to the meeting-agent Lambda so it knows the
+    calendar event has been created.  The meeting agent uses this to release
+    the consolidated email (if it's still holding for calendar confirmation).
+    Fire-and-forget — failures are logged but never raise.
+    """
+    if not MEETING_LAMBDA_URL:
+        logger.warning("_notify_meeting_agent: MEETING_LAMBDA_URL not set — skipping callback")
+        return
+    try:
+        payload = {
+            "type":          "calendar_done",
+            "secret":        _os.environ.get("WEBHOOK_SECRET", ""),
+            "s3_key":        s3_key,
+            "calendar_link": calendar_link or "",
+        }
+        resp = requests.post(MEETING_LAMBDA_URL, json=payload, timeout=8)
+        if resp.ok:
+            logger.info("_notify_meeting_agent: callback sent OK → %s", resp.status_code)
+        else:
+            logger.warning("_notify_meeting_agent: callback returned %s: %s",
+                           resp.status_code, resp.text[:200])
+    except Exception as e:
+        logger.warning("_notify_meeting_agent: callback failed (non-fatal): %s", e)
 
 
 def email_post_cancel(state: OrchestratorState) -> OrchestratorState:

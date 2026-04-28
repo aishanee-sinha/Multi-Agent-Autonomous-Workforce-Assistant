@@ -87,20 +87,48 @@ def parse_input(state: OrchestratorState) -> OrchestratorState:
         raw_value  = urllib.parse.unquote_plus(action.get("value", ""))
         
         session_id = raw_value if raw_value and raw_value not in ("", "cancel", "{}") else None
-        if session_id:
-            value_dict = load_session(session_id) or {}
-            if not value_dict:
-                logger.warning("[trace=%s] session %s expired or missing", trace_id, session_id)
-        else:
-            value_dict = {}
 
+        # For confirm_summary: value is direct JSON (not a Redis session ID)
+        # For other actions: value is a Redis session ID
         if action_id in ("confirm_summary", "cancel_summary"):
+            # Try direct JSON parse first (new approach — no Redis expiry risk)
+            value_dict = {}
+            if raw_value and raw_value not in ("", "cancel", "{}"):
+                try:
+                    value_dict = json.loads(raw_value)
+                    session_id = None  # no session ID for direct JSON
+                    logger.info("[trace=%s] confirm_summary: parsed direct JSON value", trace_id)
+                except (json.JSONDecodeError, ValueError):
+                    # Fallback: treat as Redis session ID (old cards)
+                    value_dict = load_session(raw_value) or {}
+                    if not value_dict:
+                        logger.warning("[trace=%s] session %s expired or missing", trace_id, raw_value)
             logger.info("[trace=%s] -> meeting_transcript (button: %s)", trace_id, action_id)
             return state.model_copy(update={
                 "intent":             "meeting_transcript",
                 "slack_event_type":   "interactivity",
                 "slack_action_id":    action_id,
                 "slack_action_value": value_dict,
+                "session_id":         session_id,
+                "channel_id":         payload["channel"]["id"],
+                "preview_ts":         payload["container"]["message_ts"],
+            })
+
+        if action_id in ("confirm_meeting_jira", "skip_meeting_jira"):
+            # value is a Redis session ID for Jira button clicks — load it explicitly
+            jira_value_dict = {}
+            if session_id:
+                jira_value_dict = load_session(session_id) or {}
+                if not jira_value_dict:
+                    logger.warning("[trace=%s] Jira session %s expired or missing", trace_id, session_id)
+                else:
+                    logger.info("[trace=%s] Jira session loaded ok: %s", trace_id, session_id)
+            logger.info("[trace=%s] -> meeting_transcript (jira button: %s)", trace_id, action_id)
+            return state.model_copy(update={
+                "intent":             "meeting_transcript",
+                "slack_event_type":   "interactivity",
+                "slack_action_id":    action_id,
+                "slack_action_value": jira_value_dict,
                 "session_id":         session_id,
                 "channel_id":         payload["channel"]["id"],
                 "preview_ts":         payload["container"]["message_ts"],
@@ -180,6 +208,32 @@ def parse_input(state: OrchestratorState) -> OrchestratorState:
             "transcript_file_id":   body.get("file_id"),
             "transcript_file_name": body.get("file_name", "transcript.txt"),
         })
+
+    if body.get("type") == "calendar_done":
+        if body.get("secret") != WEBHOOK_SECRET:
+            logger.warning("[trace=%s] calendar_done: invalid secret — rejecting", trace_id)
+            return state.model_copy(update={"intent": "none", "error": "Invalid secret"})
+        s3_key       = body.get("s3_key", "")
+        calendar_link = body.get("calendar_link", "")
+        logger.info("[trace=%s] calendar_done: s3_key=%s link=%s", trace_id, s3_key, calendar_link)
+        # Store calendar_done flag in Redis so _send_consolidated_email can include it
+        if s3_key:
+            try:
+                import boto3 as _boto3, json as _json
+                s3 = _boto3.client("s3")
+                from state import S3_BUCKET
+                raw  = s3.get_object(Bucket=S3_BUCKET, Key=f"{s3_key}/meta.json")["Body"].read()
+                meta = _json.loads(raw.decode("utf-8"))
+                meta["calendar_link"]    = calendar_link
+                meta["calendar_done"]    = True
+                s3.put_object(
+                    Bucket=S3_BUCKET, Key=f"{s3_key}/meta.json",
+                    Body=_json.dumps(meta, indent=2).encode(), ContentType="application/json",
+                )
+                logger.info("calendar_done: meta.json updated with calendar_link")
+            except Exception as ce:
+                logger.warning("calendar_done: could not update meta.json: %s", ce)
+        return state.model_copy(update={"intent": "none"})
 
     if body.get("message", {}).get("data"):
         try:
