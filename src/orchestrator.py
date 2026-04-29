@@ -299,7 +299,7 @@ def router_agent(state: OrchestratorState) -> OrchestratorState:
 
     sys_msg = (
         "You are an intent router for a workplace automation system.\n"
-        "  'slack'  — Slack message asking to create a Jira task\n"
+        "  'slack'  — Slack message asking to create, update, close, resolve, assign, comment on, or modify a Jira ticket\n"
         "  'email'  — email containing meeting scheduling intent\n"
         "  'none'   — not actionable\n"
         "Return a RouterDecision JSON."
