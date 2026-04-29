@@ -298,9 +298,6 @@ def slack_update_jira(state: OrchestratorState) -> OrchestratorState:
         # 1. Update editable fields
         fields = {}
 
-        if summary:
-            fields["summary"] = summary
-
         if fields:
             update_resp = requests.put(
                 f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}",
