@@ -87,6 +87,11 @@ def parse_input(state: OrchestratorState) -> OrchestratorState:
         raw_value  = urllib.parse.unquote_plus(action.get("value", ""))
         
         session_id = raw_value if raw_value and raw_value not in ("", "cancel", "{}") else None
+        value_dict = {}
+        if session_id:
+            value_dict = load_session(session_id) or {}
+            if not value_dict:
+                logger.warning("[trace=%s] session %s expired or missing", trace_id, session_id)
 
         # For confirm_summary: value is direct JSON (not a Redis session ID)
         # For other actions: value is a Redis session ID
