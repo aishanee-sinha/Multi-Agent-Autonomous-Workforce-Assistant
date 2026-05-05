@@ -149,19 +149,42 @@ class JiraProposalVerdict(BaseModel):
 
 P4_SYSTEM_PROMPT = (
     "You are a professional meeting minutes assistant. "
-    "Your output must contain exactly these sections in order: "
+    "Your output MUST contain exactly these five sections in this exact order: "
     "ABSTRACT, DECISIONS, PROBLEMS, ACTIONS, ACTIONS_JSON. "
-    "ACTIONS_JSON must be a valid JSON array."
+    "The ACTIONS_JSON section is MANDATORY and MUST be a valid JSON array — never omit it. "
+    "Never output plain text where JSON is required. "
+    "Never stop before outputting ACTIONS_JSON."
 )
+
 P4_USER_INSTRUCTION = (
-    "Given the meeting transcript below, produce:\n"
-    "  ABSTRACT:   A concise paragraph summarising the meeting.\n"
-    "  DECISIONS:  Bullet list of decisions made.\n"
-    "  PROBLEMS:   Bullet list of problems or risks raised.\n"
-    "  ACTIONS:    Bullet list formatted as [Owner] - task - Due: deadline.\n"
-    "  ACTIONS_JSON: JSON array, each item has keys: owner, task, deadline, discussed_at_sec.\n"
-    "Rules: Do not fabricate facts. Set owner/deadline to TBD when not mentioned. "
-    "ACTIONS_JSON must parse as valid JSON. discussed_at_sec is float or 0.0."
+    "Given the meeting transcript below, produce all five sections exactly as shown.\n\n"
+    "ABSTRACT: A concise paragraph (2-4 sentences) summarising the meeting.\n\n"
+    "DECISIONS: Bullet list of decisions made. Use '- ' prefix per item.\n\n"
+    "PROBLEMS: Bullet list of problems or risks raised. Use '- ' prefix per item.\n\n"
+    "ACTIONS: Bullet list of action items. Format each as: - [Owner Name] Task description - Due: deadline\n\n"
+    "ACTIONS_JSON: A JSON array where EVERY action item from ACTIONS appears as an object.\n"
+    "Each object MUST have these exact keys: owner, task, deadline, discussed_at_sec\n"
+    "Rules:\n"
+    "  - owner: full name string, use TBD if not mentioned\n"
+    "  - task: clear action description string\n"
+    "  - deadline: date or relative string, use TBD if not mentioned\n"
+    "  - discussed_at_sec: seconds elapsed from the START of the meeting when this item was discussed.\n"
+    "    If the transcript has timestamps like [14:02] or 14:02, convert to seconds from the first timestamp.\n"
+    "    Example: if meeting starts at 14:00 and item discussed at 14:07, discussed_at_sec = 420.0\n"
+    "    If no timestamps in transcript, use 0.0\n"
+    "  - discussed_at_sec MUST be a number (float), NEVER an epoch timestamp like 1684728000.0\n\n"
+    "EXAMPLE of correct ACTIONS_JSON output:\n"
+    "ACTIONS_JSON:\n"
+    "[\n"
+    "  {\"owner\": \"Alice Smith\", \"task\": \"Fix login bug\", \"deadline\": \"Friday\", \"discussed_at_sec\": 120.0},\n"
+    "  {\"owner\": \"Bob Jones\", \"task\": \"Update documentation\", \"deadline\": \"TBD\", \"discussed_at_sec\": 0.0}\n"
+    "]\n\n"
+    "CRITICAL RULES:\n"
+    "  1. ACTIONS_JSON is NOT optional — always output it even if ACTIONS is empty (use [])\n"
+    "  2. The JSON array must be valid — use double quotes, no trailing commas\n"
+    "  3. Number of items in ACTIONS_JSON must match number of items in ACTIONS\n"
+    "  4. Do not fabricate facts not in the transcript\n"
+    "  5. Output ACTIONS_JSON as the LAST section — never stop before it\n"
 )
 MERGE_SYSTEM_PROMPT = (
     "You are a professional meeting minutes assistant. "
@@ -293,7 +316,7 @@ def _preprocess(transcript):
 # vLLM call + inference helpers
 # =============================================================================
 
-def _vllm_call(messages, max_new_tokens=768):
+def _vllm_call(messages, max_new_tokens=1536):
     resp = requests.post(
         f"http://{EC2_IP}:8000/v1/chat/completions",
         json={"model": VLLM_MODEL_NAME, "messages": messages,
@@ -366,10 +389,51 @@ def _run_chunked_inference(transcript):
         key = str(ai.get("task", ""))[:80].lower().strip()
         if key and key not in seen_tasks:
             seen_tasks.add(key); deduped.append(ai)
+
+    # ── JSON recovery pass ────────────────────────────────────────────────────
+    # If model generated ACTIONS text but no ACTIONS_JSON, do a targeted
+    # conversion call to extract structured JSON from the plain-text actions.
+    actions_text_merged = _dedup(all_actions)
+    if not deduped and actions_text_merged and actions_text_merged != "None identified.":
+        logger.info("ACTIONS_JSON empty — attempting JSON recovery pass")
+        recovery_messages = [
+            {"role": "system", "content":
+                "You are a JSON extractor. Convert the action items list into a JSON array. "
+                "Output ONLY the JSON array, nothing else. No markdown, no explanation."},
+            {"role": "user", "content":
+                f"Convert these action items into a JSON array where each item has keys: "
+                f"owner (string), task (string), deadline (string), discussed_at_sec (float).\n\n"
+                f"Action items:\n{actions_text_merged}\n\n"
+                f"Rules:\n"
+                f"- Use TBD for missing owner or deadline\n"
+                f"- discussed_at_sec must be 0.0 if unknown\n"
+                f"- Output ONLY the JSON array starting with [ and ending with ]\n"
+                f"- No explanation, no markdown code blocks, just the raw JSON array\n\n"
+                f"Example output format:\n"
+                f'[{{"owner": "Alice", "task": "Fix bug", "deadline": "Friday", "discussed_at_sec": 0.0}}]'},
+        ]
+        try:
+            recovery_raw = _vllm_call(recovery_messages, max_new_tokens=512)
+            # Strip markdown fences if present
+            recovery_clean = re.sub(r"```(?:json)?", "", recovery_raw).strip().strip("`").strip()
+            # Find the JSON array
+            arr_match = re.search(r"\[.*\]", recovery_clean, re.DOTALL)
+            if arr_match:
+                recovered = json.loads(arr_match.group(0))
+                if isinstance(recovered, list) and recovered:
+                    deduped = recovered
+                    logger.info("JSON recovery pass succeeded: %d item(s) recovered", len(deduped))
+                else:
+                    logger.warning("JSON recovery pass returned empty array")
+            else:
+                logger.warning("JSON recovery pass: no array found in output")
+        except Exception as re_e:
+            logger.error("JSON recovery pass failed: %s", re_e)
+
     result  = f"ABSTRACT:\n{merged_abstract}\n\n"
     result += f"DECISIONS:\n{_dedup(all_decisions) or 'None identified.'}\n\n"
     result += f"PROBLEMS:\n{_dedup(all_problems) or 'None identified.'}\n\n"
-    result += f"ACTIONS:\n{_dedup(all_actions) or 'None identified.'}\n\n"
+    result += f"ACTIONS:\n{actions_text_merged or 'None identified.'}\n\n"
     result += f"ACTIONS_JSON:\n{json.dumps(deduped, indent=2)}"
     return result
 
@@ -412,6 +476,78 @@ def _parse_actions_from_text(actions_text):
         elif line:
             items.append({"owner": "TBD", "task": line[:200], "deadline": "TBD", "discussed_at_sec": 0.0})
     return items
+
+
+def _fix_discussed_at_sec(action_items: list, transcript: str) -> list:
+    """
+    Fix discussed_at_sec values that the model generated incorrectly.
+    - Detects epoch timestamps (>86400) and resets them to 0.0
+    - Extracts the meeting start time from transcript timestamps like [14:00] or HH:MM
+    - Converts HH:MM timestamps found near each action item's owner/task to seconds from start
+    """
+    if not action_items:
+        return action_items
+
+    # Extract all HH:MM timestamps from transcript with their positions
+    ts_pattern = re.compile(r"(?:\[\w[^\]]*\]\s*)?(\d{1,2}):(\d{2})(?:\s|$)")
+    timestamps = []
+    for m in ts_pattern.finditer(transcript):
+        h, mi = int(m.group(1)), int(m.group(2))
+        if 0 <= h <= 23 and 0 <= mi <= 59:
+            pos_seconds = h * 3600 + mi * 60
+            timestamps.append((m.start(), pos_seconds))
+
+    if not timestamps:
+        # No timestamps in transcript — just fix bad epoch values
+        fixed = []
+        for ai in action_items:
+            val = ai.get("discussed_at_sec", 0.0)
+            if isinstance(val, (int, float)) and val > 86400:
+                ai = {**ai, "discussed_at_sec": 0.0}
+            fixed.append(ai)
+        return fixed
+
+    start_seconds = timestamps[0][1]  # meeting start time in seconds of day
+
+    fixed = []
+    for ai in action_items:
+        val = ai.get("discussed_at_sec", 0.0)
+        # If model generated a valid relative timestamp (0-86400), keep it
+        if isinstance(val, (int, float)) and 0.0 <= val <= 86400:
+            fixed.append(ai)
+            continue
+
+        # Bad epoch or string — try to find the timestamp near this item in transcript
+        task_text = str(ai.get("task", ""))[:60].lower()
+        owner_text = str(ai.get("owner", ""))[:30].lower()
+        best_pos = None
+        best_score = -1
+
+        # Find the position in transcript where this task/owner is discussed
+        for word in task_text.split()[:5]:
+            if len(word) < 4:
+                continue
+            idx = transcript.lower().find(word)
+            if idx > 0:
+                # Find nearest timestamp before this position
+                for ts_pos, ts_sec in reversed(timestamps):
+                    if ts_pos <= idx:
+                        score = len(word)
+                        if score > best_score:
+                            best_score = score
+                            best_pos = ts_sec
+                        break
+
+        if best_pos is not None:
+            relative_sec = float(best_pos - start_seconds)
+            if relative_sec < 0:
+                relative_sec = 0.0
+        else:
+            relative_sec = 0.0
+
+        fixed.append({**ai, "discussed_at_sec": relative_sec})
+
+    return fixed
 
 
 # =============================================================================
@@ -874,21 +1010,46 @@ def meeting_triage_cod(state: OrchestratorState) -> OrchestratorState:
         logger.info("No action items to triage")
         return state.model_copy(update={"meeting_triage": []})
 
-    transcript     = state.transcript_processed or state.transcript_text or ""
-    triage_results = []
-    logger.info("Starting CoD triage for %d action item(s)", len(actions))
+    # Fix any bad discussed_at_sec values (epoch timestamps or invalid floats)
+    transcript = state.transcript_processed or state.transcript_text or ""
+    actions = _fix_discussed_at_sec(actions, transcript)
+    state = state.model_copy(update={"meeting_summary_parsed": {**parsed, "actions_json": actions}})
 
-    for ai in actions:
+    transcript     = state.transcript_processed or state.transcript_text or ""
+    logger.info("Starting CoD triage for %d action item(s) [parallel]", len(actions))
+
+    def _triage_one(ai):
         result = _run_triage_cod(ai, transcript, actions, problems)
-        triage_results.append(result or {
+        return result or {
             "owner": ai.get("owner", "TBD"), "task": ai.get("task", ""),
             "task_key": str(ai.get("task", ""))[:80].lower().strip(),
             "deadline": ai.get("deadline", "TBD"),
             "final_priority": "Medium", "risk_summary": "Triage unavailable.",
             "deadline_note": "On track", "rationale": "CoD triage failed — defaulting to Medium.",
-        })
+        }
 
-    logger.info("CoD triage complete: %d item(s) classified", len(triage_results))
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    # Cap workers at 4 to avoid overwhelming vLLM with too many concurrent requests
+    max_workers = min(4, len(actions))
+    triage_results = [None] * len(actions)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {executor.submit(_triage_one, ai): i for i, ai in enumerate(actions)}
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                triage_results[idx] = future.result()
+            except Exception as e:
+                logger.error("Triage parallel worker failed for idx=%d: %s", idx, e)
+                ai = actions[idx]
+                triage_results[idx] = {
+                    "owner": ai.get("owner", "TBD"), "task": ai.get("task", ""),
+                    "task_key": str(ai.get("task", ""))[:80].lower().strip(),
+                    "deadline": ai.get("deadline", "TBD"),
+                    "final_priority": "Medium", "risk_summary": "Triage unavailable.",
+                    "deadline_note": "On track", "rationale": "CoD triage failed — defaulting to Medium.",
+                }
+
+    logger.info("CoD triage complete: %d item(s) classified [parallel]", len(triage_results))
     return state.model_copy(update={"meeting_triage": triage_results})
 
 
@@ -917,19 +1078,35 @@ def meeting_jira_cod(state: OrchestratorState) -> OrchestratorState:
     transcript = state.transcript_processed or state.transcript_text or ""
     proposals  = []
 
-    logger.info("Starting Jira CoD for %d action item(s)", len(actions))
-    for ai in actions:
+    logger.info("Starting Jira CoD for %d action item(s) [parallel]", len(actions))
+
+    def _jira_one(ai):
         task_key      = str(ai.get("task", ""))[:80].lower().strip()
         triage_result = triage_map.get(task_key)
         excerpt       = _find_transcript_excerpt(ai, transcript)
-        result        = _run_jira_cod(ai, excerpt, triage_result, actions)
+        return ai, _run_jira_cod(ai, excerpt, triage_result, actions)
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    max_workers = min(3, len(actions))
+    results_ordered = [None] * len(actions)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {executor.submit(_jira_one, ai): i for i, ai in enumerate(actions)}
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                results_ordered[idx] = future.result()
+            except Exception as e:
+                logger.error("Jira CoD parallel worker failed for idx=%d: %s", idx, e)
+                results_ordered[idx] = (actions[idx], None)
+
+    for ai, result in results_ordered:
         if result:
             proposals.append(result)
             logger.info("Jira CoD PROPOSE: [%s] %s", ai.get("owner"), result["summary"][:60])
         else:
             logger.info("Jira CoD SKIP: [%s] %s", ai.get("owner"), str(ai.get("task", ""))[:40])
 
-    logger.info("Jira CoD complete: %d/%d items proposed as tickets", len(proposals), len(actions))
+    logger.info("Jira CoD complete: %d/%d items proposed as tickets [parallel]", len(proposals), len(actions))
     return state.model_copy(update={"meeting_jira_proposals": proposals})
 
 
@@ -1414,25 +1591,29 @@ def _send_consolidated_email(
                     f'{summary_text.replace(chr(10), "<br>")}</div>'
                     '<br><hr style="border:1px solid #ecf0f1;">'
                 )
-            # Build jira_map using fuzzy matching — Jira summaries get truncated at 120 chars
-            # so we match by checking if task_desc and summary share a common 60-char prefix
-            jira_pairs = [
-                (t.get("summary", "").lower().strip(), t.get("jira_key", ""))
-                for t in tickets_created
-                if t.get("jira_key")
-            ]
+            # Build jira_map: match by OWNER (reliable) rather than task text (unreliable
+            # because Jira summaries are reworded by CoD and truncated at 120 chars).
+            # owner_jira_map: owner_lower -> jira_key (last ticket wins if same owner has multiple)
+            owner_jira_map = {}
+            for t in tickets_created:
+                if t.get("jira_key"):
+                    owner_key = t.get("assignee", t.get("owner", "")).lower().strip()
+                    if owner_key:
+                        owner_jira_map[owner_key] = t.get("jira_key", "")
 
-            def _find_jira_key(task_desc):
-                task_lower = task_desc.lower().strip()
-                for summary_lower, jkey in jira_pairs:
-                    if (task_lower[:60] == summary_lower[:60] or
-                            task_lower.startswith(summary_lower[:60]) or
-                            summary_lower.startswith(task_lower[:60])):
-                        return jkey
+            def _find_jira_key_by_owner(owner):
+                owner_lower = owner.lower().strip()
+                # Exact match first
+                if owner_lower in owner_jira_map:
+                    return owner_jira_map[owner_lower]
+                # Partial match (e.g. "Ketki" matches "Ketki Maddiwar")
+                for k, v in owner_jira_map.items():
+                    if owner_lower in k or k in owner_lower:
+                        return v
                 return ""
 
             jira_map = {
-                ai.get("task", "")[:80].lower().strip(): _find_jira_key(ai.get("task", ""))
+                ai.get("task", "")[:80].lower().strip(): _find_jira_key_by_owner(ai.get("owner", ""))
                 for ai in meta.get("actions_json", [])
             }
             # Regenerate CSV fresh so jira_key column reflects confirmed tickets
