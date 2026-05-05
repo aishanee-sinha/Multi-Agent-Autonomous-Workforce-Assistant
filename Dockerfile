@@ -1,25 +1,13 @@
-# Use the official AWS Lambda Python image
 FROM public.ecr.aws/lambda/python:3.11
-
-# 1. Install system tools needed for potential C-extensions
 RUN yum install -y gcc gcc-c++ gzip tar make
-
-# 2. Install the Rust compiler (Keep this for tiktoken/tokenization support)
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
-
-# 3. Copy and install requirements
 COPY requirements.txt ${LAMBDA_TASK_ROOT}
-
-# Use a cache mount to speed up re-builds
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt
-
-# Copy all source files
 COPY src/ ${LAMBDA_TASK_ROOT}/
-
-# Force all python caching and homedir resolutions to /tmp
+RUN find ${LAMBDA_TASK_ROOT} -name "*.py" -exec chmod 755 {} \; && \
+    find ${LAMBDA_TASK_ROOT} -type d -exec chmod 755 {} \; && \
+    chown -R root:root ${LAMBDA_TASK_ROOT}
 ENV HOME="/tmp"
-
-# Lambda handler entrypoint
 CMD ["orchestrator.sqs_handler"]

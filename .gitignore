@@ -3,6 +3,8 @@
 **/client_secret.json
 **/google_token.json
 *.pem
+**/tokens_*
+tokens_*
 
 # Python
 __pycache__

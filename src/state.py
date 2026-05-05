@@ -46,6 +46,8 @@ SES_FROM_EMAIL     = os.environ.get("SES_FROM_EMAIL", "")
 PARTICIPANT_EMAILS = [
     e.strip() for e in os.environ.get("PARTICIPANT_EMAILS", "").split(",") if e.strip()
 ]
+# Email agent inbox — receives meeting summaries for conflict detection + participant forwarding
+EMAIL_AGENT_INBOX  = os.environ.get("EMAIL_AGENT_INBOX", "msadi.finalproject@gmail.com")
 S3_BUCKET          = os.environ.get("S3_BUCKET", "qwen-lora-weights")
 S3_PREFIX          = os.environ.get("S3_TRANSCRIPT_PREFIX", "transcript_summarizer")
 VLLM_MODEL_NAME    = os.environ.get("VLLM_MODEL_NAME", "meeting")
@@ -66,7 +68,7 @@ def _llm(structured_output=None, model_name=None) -> ChatOpenAI:
         model=model_name,
         openai_api_base=f"http://{EC2_IP}:8000/v1",
         openai_api_key="none",
-        timeout=45,
+        timeout=120,
         max_retries=0,
     )
     return base.with_structured_output(structured_output) if structured_output else base
@@ -105,6 +107,10 @@ class OrchestratorState(BaseModel):
     slack_action_value: Optional[dict] = None
     jira_account_id: Optional[str] = None
     jira_key: Optional[str] = None
+    slack_action_type: Optional[str] = None
+    slack_issue_key: Optional[str] = None
+    slack_update_status: Optional[str] = None
+    slack_comment: Optional[str] = None
 
     # ── Email/Calendar-specific ────────────────────────────────────────────
     email_source: Literal["pubsub", "direct", "unknown"] = "unknown"
@@ -139,6 +145,8 @@ class OrchestratorState(BaseModel):
     meeting_s3_key:       Optional[str]   = None  # S3 prefix for all artifacts
     meeting_ics_bytes:    Optional[bytes] = None  # ICS calendar bytes
     meeting_csv_bytes:    Optional[bytes] = None  # CSV action items bytes
+    meeting_jira_proposals:     Optional[list] = None  # CoD-detected Jira tickets to propose
+    meeting_jira_queue_session: Optional[str]  = None  # Redis session ID for pending Jira proposal queue
 
     # ── Shared control ─────────────────────────────────────────────────────
     error: Optional[str] = None
