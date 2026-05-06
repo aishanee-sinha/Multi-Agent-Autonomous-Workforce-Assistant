@@ -87,11 +87,6 @@ def parse_input(state: OrchestratorState) -> OrchestratorState:
         raw_value  = urllib.parse.unquote_plus(action.get("value", ""))
         
         session_id = raw_value if raw_value and raw_value not in ("", "cancel", "{}") else None
-        value_dict = {}
-        if session_id:
-            value_dict = load_session(session_id) or {}
-            if not value_dict:
-                logger.warning("[trace=%s] session %s expired or missing", trace_id, session_id)
 
         # For confirm_summary: value is direct JSON (not a Redis session ID)
         # For other actions: value is a Redis session ID
@@ -141,21 +136,31 @@ def parse_input(state: OrchestratorState) -> OrchestratorState:
 
         if action_id in ("select_slot_0", "select_slot_1", "select_slot_2"):
             slot_index = int(action_id[-1])
-            all_slots  = value_dict.get("all_proposed_slots", [])
+            # Load the calendar session directly — value_dict is only set in
+            # confirm_summary block which doesn't run for slot selection buttons
+            slot_session_id = payload["actions"][0]["value"]
+            slot_value_dict = {}
+            try:
+                slot_value_dict = load_session(slot_session_id) or {}
+                if not slot_value_dict:
+                    logger.warning("[trace=%s] select_slot: session %s not found or expired", trace_id, slot_session_id)
+            except Exception as _se:
+                logger.warning("[trace=%s] select_slot: session load failed: %s", trace_id, _se)
+            all_slots  = slot_value_dict.get("all_proposed_slots", [])
             chosen     = all_slots[slot_index] if slot_index < len(all_slots) else {}
             logger.info(
                 "[trace=%s] -> email slot %d selected session=%s start=%s",
                 trace_id, slot_index, session_id, chosen.get("start"),
             )
             pending_meeting = {
-                "email_data": value_dict.get("email_data"),
+                "email_data": slot_value_dict.get("email_data"),
                 "model_output": {
-                    "title":           value_dict.get("meeting_title"),
+                    "title":           slot_value_dict.get("meeting_title"),
                     "start_time":      chosen.get("start"),
                     "end_time":        chosen.get("end"),
-                    "location":        value_dict.get("meeting_location"),
-                    "attendees":       value_dict.get("meeting_attendees", []),
-                    "time_confidence": value_dict.get("time_confidence"),
+                    "location":        slot_value_dict.get("meeting_location"),
+                    "attendees":       slot_value_dict.get("meeting_attendees", []),
+                    "time_confidence": slot_value_dict.get("time_confidence"),
                 },
                 "all_proposed_slots": all_slots,
                 "selected_slot_index": slot_index,
@@ -193,6 +198,7 @@ def parse_input(state: OrchestratorState) -> OrchestratorState:
 
     body_str = body_raw.strip()
     if not body_str:
+        logger.warning("[trace=%s] empty body received", trace_id)
         return state.model_copy(update={"intent": "none"})
 
     try:
@@ -218,10 +224,11 @@ def parse_input(state: OrchestratorState) -> OrchestratorState:
         if body.get("secret") != WEBHOOK_SECRET:
             logger.warning("[trace=%s] calendar_done: invalid secret — rejecting", trace_id)
             return state.model_copy(update={"intent": "none", "error": "Invalid secret"})
-        s3_key       = body.get("s3_key", "")
+        s3_key        = body.get("s3_key", "")
         calendar_link = body.get("calendar_link", "")
         logger.info("[trace=%s] calendar_done: s3_key=%s link=%s", trace_id, s3_key, calendar_link)
-        # Store calendar_done flag in Redis so _send_consolidated_email can include it
+
+        # Update meta.json with calendar link
         if s3_key:
             try:
                 import boto3 as _boto3, json as _json
@@ -229,8 +236,8 @@ def parse_input(state: OrchestratorState) -> OrchestratorState:
                 from state import S3_BUCKET
                 raw  = s3.get_object(Bucket=S3_BUCKET, Key=f"{s3_key}/meta.json")["Body"].read()
                 meta = _json.loads(raw.decode("utf-8"))
-                meta["calendar_link"]    = calendar_link
-                meta["calendar_done"]    = True
+                meta["calendar_link"] = calendar_link
+                meta["calendar_done"] = True
                 s3.put_object(
                     Bucket=S3_BUCKET, Key=f"{s3_key}/meta.json",
                     Body=_json.dumps(meta, indent=2).encode(), ContentType="application/json",
@@ -238,6 +245,56 @@ def parse_input(state: OrchestratorState) -> OrchestratorState:
                 logger.info("calendar_done: meta.json updated with calendar_link")
             except Exception as ce:
                 logger.warning("calendar_done: could not update meta.json: %s", ce)
+
+        # Release held consolidated email
+        hold_key = f"calendar_hold:{s3_key}"
+        try:
+            from redis_store import _get_client as _get_r
+            from meeting_agent import _send_consolidated_email
+            import json as _json2
+            _r = _get_r()
+            hold_raw = _r.get(hold_key)
+            if hold_raw:
+                hold_data = _json2.loads(hold_raw.decode())
+                _r.delete(hold_key)
+                logger.info("calendar_done: found held email — sending with calendar_link=%s",
+                            calendar_link[:60] if calendar_link else "none")
+
+                # Update Slack with approved slot
+                _channel = hold_data.get("channel_id", "") or hold_data.get("channel", "")
+                if _channel:
+                    try:
+                        from slack_sdk import WebClient as _WC
+                        from state import SLACK_BOT_TOKEN as _SBT
+                        _slack = _WC(token=_SBT)
+                        _slot_text = (
+                            "\u2705 *Calendar event confirmed!*\n"
+                            f"\U0001f4c5 Slot approved: <{calendar_link}|View calendar event>\n"
+                            "_You will receive a Google Calendar invite separately._"
+                            if calendar_link else
+                            "\u2705 *Calendar agent completed scheduling.*\n"
+                            "_You will receive a Google Calendar invite separately._"
+                        )
+                        _slack.chat_postMessage(channel=_channel, text=_slot_text)
+                        logger.info("calendar_done: posted approved slot to Slack channel=%s", _channel)
+                    except Exception as _se:
+                        logger.warning("calendar_done: Slack update failed: %s", _se)
+
+                _send_consolidated_email(
+                    tickets_created=hold_data.get("tickets_created", []),
+                    tickets_skipped=hold_data.get("tickets_skipped", 0),
+                    file_name=hold_data.get("file_name", "meeting"),
+                    channel=hold_data.get("channel", ""),
+                    s3_key=hold_data.get("s3_key", ""),
+                )
+            else:
+                logger.info(
+                    "calendar_done: no held email found for s3_key=%s "
+                    "(may have already sent or TTL expired)", s3_key,
+                )
+        except Exception as _re:
+            logger.warning("calendar_done: could not release held email: %s", _re)
+
         return state.model_copy(update={"intent": "none"})
 
     if body.get("message", {}).get("data"):
@@ -299,7 +356,7 @@ def router_agent(state: OrchestratorState) -> OrchestratorState:
 
     sys_msg = (
         "You are an intent router for a workplace automation system.\n"
-        "  'slack'  — Slack message asking to create, update, close, resolve, assign, comment on, or modify a Jira ticket\n"
+        "  'slack'  — Slack message asking to create a Jira task\n"
         "  'email'  — email containing meeting scheduling intent\n"
         "  'none'   — not actionable\n"
         "Return a RouterDecision JSON."

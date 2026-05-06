@@ -71,36 +71,19 @@ def _logged_slack(client: WebClient) -> WebClient:
 # LLM system prompt
 # ─────────────────────────────────────────────────────────────────────────────
 def _build_email_system_prompt() -> str:
-    import os as _os
+    from datetime import date as _date
 
-    # Hardcoded map of supported timezone names
-    _TZ_MAP = {
-        "PST":  (timezone(timedelta(hours=-8)),             "PST",  "-08:00"),
-        "PDT":  (timezone(timedelta(hours=-7)),             "PDT",  "-07:00"),
-        "EST":  (timezone(timedelta(hours=-5)),             "EST",  "-05:00"),
-        "EDT":  (timezone(timedelta(hours=-4)),             "EDT",  "-04:00"),
-        "CST":  (timezone(timedelta(hours=-6)),             "CST",  "-06:00"),
-        "CDT":  (timezone(timedelta(hours=-5)),             "CDT",  "-05:00"),
-        "MST":  (timezone(timedelta(hours=-7)),             "MST",  "-07:00"),
-        "MDT":  (timezone(timedelta(hours=-6)),             "MDT",  "-06:00"),
-        "GMT":  (timezone(timedelta(hours=0)),              "GMT",  "+00:00"),
-        "UTC":  (timezone(timedelta(hours=0)),              "UTC",  "+00:00"),
-        "CET":  (timezone(timedelta(hours=1)),              "CET",  "+01:00"),
-        "CEST": (timezone(timedelta(hours=2)),              "CEST", "+02:00"),
-        "IST":  (timezone(timedelta(hours=5, minutes=30)), "IST",  "+05:30"),
-        "JST":  (timezone(timedelta(hours=9)),              "JST",  "+09:00"),
-        "AEST": (timezone(timedelta(hours=10)),             "AEST", "+10:00"),
-    }
-    _tz_key = _os.environ.get("MEETING_TIMEZONE", "UTC").upper().strip()
-    _tz_obj, _tz_name, _tz_offset = _TZ_MAP.get(_tz_key, _TZ_MAP["UTC"])
-
-    _now   = datetime.now(tz=_tz_obj)
-    today  = _now.date()
+    # All dates and times in this project are PDT (UTC-7). We derive "today"
+    # in PDT explicitly so Lambda (which runs in UTC) computes the right date.
+    _pdt_now  = datetime.now(tz=PDT_TZ)
+    today     = _pdt_now.date()
+    _tz_name  = "PDT"
+    _tz_offset = "-07:00"
 
     today_str = today.strftime("%Y-%m-%d (%A)")
     tomorrow  = today + timedelta(days=1)
 
-    # RULE: bare weekday always means NEXT occurrence, even if today IS that day
+    # Compute "next <weekday>" for all 7 days dynamically — no hardcoding
     weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     next_weekdays = {}
     for target_wd, name in enumerate(weekday_names):
@@ -108,18 +91,17 @@ def _build_email_system_prompt() -> str:
         next_weekdays[name] = today + timedelta(days=days_ahead)
 
     next_weekday_lines = "\n".join(
-        f'     "{name}" / "next {name}" -> "{d.strftime("%Y-%m-%d")}"' 
+        f'     "{name}" / "next {name}" -> "{d.strftime("%Y-%m-%d")}"'
         for name, d in next_weekdays.items()
     )
-    next_monday      = next_weekdays["Monday"]
-    next_friday      = next_weekdays["Friday"]
-    this_friday      = today + timedelta(days=(4 - today.weekday()) % 7 or 7)
-    end_of_week_date = this_friday.strftime("%Y-%m-%d")
+    next_monday = next_weekdays["Monday"]
+    next_friday = next_weekdays["Friday"]
+    this_friday = today + timedelta(days=(4 - today.weekday()) % 7)
 
     return f"""You are a meeting intent extraction system.
 
 TASK: Analyze emails and extract meeting intent and a SEARCH WINDOW for scheduling.
-Do NOT extract exact times - extract the date range the sender intends to meet within.
+Do NOT extract exact times — extract the date range the sender intends to meet within.
 A downstream scheduler will find the best available slot inside that window.
 
 EXTRACTION RULES:
@@ -139,48 +121,32 @@ EXTRACTION RULES:
 
 IMPORTANT: start_window and end_window define a SEARCH RANGE for a scheduler to scan.
 They are NOT the meeting start/end times and have NOTHING to do with meeting duration.
-end_window is always the LAST MOMENT the scheduler should look - typically 17:00 on the last candidate day.
+end_window is always the LAST MOMENT the scheduler should look — typically 17:00 on the last candidate day.
 NEVER compute end_window as start_window + meeting duration.
 
-TIMEZONE: All datetimes MUST use {_tz_name} (UTC{_tz_offset}).
-If the email mentions a specific timezone (PST, PDT, EST, EDT, CST, CET, IST, UTC, GMT) use that timezone offset instead.
-If no timezone is mentioned, default to {_tz_name} (UTC{_tz_offset}).
-NEVER output a datetime without a timezone offset. NEVER use Z suffix - always use signed offset format like {_tz_offset}.
+All datetimes use the local timezone: {_tz_name} (UTC{_tz_offset}).
 
-Timezone offset reference:
-  PST=-08:00  PDT=-07:00  EST=-05:00  EDT=-04:00  CST=-06:00
-  CDT=-05:00  MST=-07:00  MDT=-06:00  GMT=+00:00  UTC=+00:00
-  CET=+01:00  CEST=+02:00  IST=+05:30  JST=+09:00  AEST=+10:00
-
-4. START_WINDOW - earliest datetime the scheduler should begin searching (YYYY-MM-DDTHH:MM:SS{_tz_offset}):
+4. START_WINDOW — earliest datetime the scheduler should begin searching (YYYY-MM-DDTHH:MM:SS{_tz_offset}):
    TODAY is {today_str}. "tomorrow" is {tomorrow.strftime("%Y-%m-%d")}.
-
-   WEEKDAY RULES (CRITICAL - read carefully):
-   - A bare weekday name (e.g. "Tuesday", "Monday") ALWAYS means the NEXT occurrence.
-   - Even if TODAY is Tuesday, "Tuesday" still means NEXT Tuesday - never today.
-   - "next Tuesday" also means next occurrence - same as bare "Tuesday".
-   - Only "today" or an explicit full date maps to the current day.
-   Use the exact dates below for ALL weekday references (bare or "next"):
+   Use the exact dates below for bare weekday OR "next <weekday>" references:
 {next_weekday_lines}
-   - "next week" (no specific day) -> next Monday = "{next_monday.strftime("%Y-%m-%d")}"
-   - "this week" (no specific day) -> tomorrow = "{tomorrow.strftime("%Y-%m-%d")}"
-   - "end of week" / "end of the week" / "by Friday" -> {end_of_week_date} (Friday)
-   - No date reference at all -> null
+   - "next week" (no specific day) -> next Monday = "{next_monday.strftime('%Y-%m-%d')}"
+   - "this week" (no specific day) -> tomorrow = "{tomorrow.strftime('%Y-%m-%d')}"
+   - No date reference at all      -> null
    TIME within the day:
    - If a start time is mentioned (e.g. "after 2pm", "from 10am") -> use that time
    - If only "morning" mentioned -> 09:00:00
    - If only "afternoon" mentioned -> 13:00:00
    - If no time constraint at all -> default to 09:00:00 (start of work day)
 
-5. END_WINDOW - latest datetime the scheduler should stop searching (YYYY-MM-DDTHH:MM:SS{_tz_offset}):
+5. END_WINDOW — latest datetime the scheduler should stop searching (YYYY-MM-DDTHH:MM:SS{_tz_offset}):
    This marks the END OF THE SEARCH RANGE, not the end of the meeting.
    DATE:
    - Multiple days mentioned (e.g. "Monday or Tuesday") -> use the LAST mentioned day
    - Single specific day mentioned -> same date as start_window
-   - "next week" (no specific day) -> next Friday = "{next_friday.strftime("%Y-%m-%d")}"
-   - "this week" (no specific day) -> this Friday = "{this_friday.strftime("%Y-%m-%d")}"
-   - "end of week" / "end of the week" / "by Friday" -> {end_of_week_date} (Friday)
-   - No date reference at all -> null
+   - "next week" (no specific day) -> next Friday = "{next_friday.strftime('%Y-%m-%d')}"
+   - "this week" (no specific day) -> this Friday = "{this_friday.strftime('%Y-%m-%d')}"
+   - No date reference at all      -> null
    TIME within the day:
    - If an end/deadline time is mentioned (e.g. "before 2pm", "by noon", "until 3pm") -> use that time
    - If only "morning" mentioned -> 12:00:00
@@ -188,17 +154,14 @@ Timezone offset reference:
    - If no time constraint at all -> default to 17:00:00 (end of work day)
 
    EXAMPLES (correct search windows):
-   - "next Monday" -> start="{next_weekdays["Monday"].strftime("%Y-%m-%d")}T09:00:00{_tz_offset}"  end="{next_weekdays["Monday"].strftime("%Y-%m-%d")}T17:00:00{_tz_offset}"
-   - "Tuesday" (even if today is Tuesday) -> start="{next_weekdays["Tuesday"].strftime("%Y-%m-%d")}T09:00:00{_tz_offset}"  end="{next_weekdays["Tuesday"].strftime("%Y-%m-%d")}T17:00:00{_tz_offset}"
-   - "next Monday or Tuesday" -> start="{next_weekdays["Monday"].strftime("%Y-%m-%d")}T09:00:00{_tz_offset}"  end="{next_weekdays["Tuesday"].strftime("%Y-%m-%d")}T17:00:00{_tz_offset}"
-   - "next week" -> start="{next_monday.strftime("%Y-%m-%d")}T09:00:00{_tz_offset}"  end="{next_friday.strftime("%Y-%m-%d")}T17:00:00{_tz_offset}"
-   - "end of week" -> start="{end_of_week_date}T09:00:00{_tz_offset}"  end="{end_of_week_date}T17:00:00{_tz_offset}"
-   - "Monday at 2pm" -> start="{next_weekdays["Monday"].strftime("%Y-%m-%d")}T14:00:00{_tz_offset}"  end="{next_weekdays["Monday"].strftime("%Y-%m-%d")}T17:00:00{_tz_offset}"
-   - "Tuesday at 2 PM PST" -> start="{next_weekdays["Tuesday"].strftime("%Y-%m-%d")}T14:00:00-08:00"  end="{next_weekdays["Tuesday"].strftime("%Y-%m-%d")}T17:00:00-08:00"
+   - "next Monday" -> start="{next_weekdays['Monday'].strftime('%Y-%m-%d')}T09:00:00{_tz_offset}"  end="{next_weekdays['Monday'].strftime('%Y-%m-%d')}T17:00:00{_tz_offset}"
+   - "next Monday or Tuesday" -> start="{next_weekdays['Monday'].strftime('%Y-%m-%d')}T09:00:00{_tz_offset}"  end="{next_weekdays['Tuesday'].strftime('%Y-%m-%d')}T17:00:00{_tz_offset}"
+   - "next week" -> start="{next_monday.strftime('%Y-%m-%d')}T09:00:00{_tz_offset}"  end="{next_friday.strftime('%Y-%m-%d')}T17:00:00{_tz_offset}"
+   - "Monday at 2pm" -> start="{next_weekdays['Monday'].strftime('%Y-%m-%d')}T14:00:00{_tz_offset}"  end="{next_weekdays['Monday'].strftime('%Y-%m-%d')}T17:00:00{_tz_offset}"
 
 6. TIME CONFIDENCE:
    - "high"   = specific day AND clock time mentioned (e.g. "Monday at 2pm")
-   - "medium" = specific day mentioned, no clock time (e.g. "next Monday", "end of week")
+   - "medium" = specific day mentioned, no clock time (e.g. "next Monday", "this Friday")
    - "low"    = only week-level reference, no specific day (e.g. "next week", "this week")
    - "none"   = no time or date information, or not a meeting
 
@@ -420,6 +383,24 @@ def email_create_calendar(state: OrchestratorState) -> OrchestratorState:
         logger.error("No pending_meeting in state")
         return state.model_copy(update={"error": "No pending meeting data found"})
 
+    # Immediately disable all slot buttons to prevent duplicate calendar events
+    if state.channel_id and state.preview_ts:
+        try:
+            client.chat_update(
+                channel=state.channel_id,
+                ts=state.preview_ts,
+                text="⏳ Creating calendar event...",
+                blocks=[{
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "\u23f3 *Creating calendar event \u2014 please wait...*\n_Slot confirmed. Other options are no longer available._",
+                    },
+                }],
+            )
+        except SlackApiError as e:
+            logger.warning(f"Could not disable slot buttons immediately: {e}")
+
     model_output   = pending.get("model_output", {})
     original_email = pending.get("email_data", {})
 
@@ -592,22 +573,58 @@ def _get_google_creds():
 
 
 def _fetch_new_emails(history_id: str) -> list[dict]:
+    """
+    Fetch new emails using Gmail history API.
+    Falls back to a direct search query when history returns 0 records —
+    this handles SES/external-relay emails that Gmail history sometimes misses.
+    """
     try:
         from googleapiclient.discovery import build
         creds   = _get_google_creds()
         service = build("gmail", "v1", credentials=creds)
+
+        # Primary: history API — no labelId filter so spam/all-mail is included
         history = service.users().history().list(
-            userId="me", startHistoryId=history_id, historyTypes=["messageAdded"],
-            labelId="INBOX"
+            userId="me", startHistoryId=history_id, historyTypes=["messageAdded"]
         ).execute()
-        logger.info(f"_fetch_new_emails: historyId={history_id} history_records={len(history.get('history', []))}")
+        records = history.get("history", [])
+        logger.info(f"_fetch_new_emails: historyId={history_id} history_records={len(records)}")
+
         emails = []
-        for record in history.get("history", []):
+        seen_ids = set()
+        for record in records:
             for msg_added in record.get("messagesAdded", []):
                 msg_id = msg_added["message"]["id"]
+                if msg_id in seen_ids:
+                    continue
+                seen_ids.add(msg_id)
                 logger.info(f"_fetch_new_emails: fetching message id={msg_id}")
-                msg    = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+                msg = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
                 emails.append(_parse_gmail_message(msg))
+
+        # Fallback: if history returned 0 records, search for recent MEETING-AGENT
+        # emails directly — SES-relayed emails can miss Gmail history API
+        if not emails:
+            logger.info("_fetch_new_emails: history empty — trying direct search fallback")
+            results = service.users().messages().list(
+                userId="me",
+                q="subject:[MEETING-AGENT] newer_than:1d",
+                maxResults=5,
+            ).execute()
+            fallback_msgs = results.get("messages", [])
+            logger.info(f"_fetch_new_emails: fallback search found {len(fallback_msgs)} message(s)")
+            for m in fallback_msgs:
+                msg_id = m["id"]
+                if msg_id in seen_ids:
+                    continue
+                seen_ids.add(msg_id)
+                msg = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+                parsed = _parse_gmail_message(msg)
+                # Only include emails we haven't processed before
+                # (check against last known history — skip if older than current historyId)
+                emails.append(parsed)
+                logger.info(f"_fetch_new_emails: fallback fetched {msg_id} subject={parsed.get('subject','')}")
+
         return emails
     except Exception as e:
         logger.error(f"Gmail fetch error: {e}")

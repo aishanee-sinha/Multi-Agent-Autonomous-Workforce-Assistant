@@ -937,6 +937,38 @@ def meeting_fetch_transcript(state: OrchestratorState) -> OrchestratorState:
         # Redis unavailable — proceed anyway, Apps Script retry logic handles dedup
         logger.warning("Redis lock unavailable, proceeding without dedup: %s", e)
 
+    # Global vLLM serialization lock — only one transcript inference runs at a time.
+    # vLLM is a single GPU instance; concurrent inference from two Lambda invocations
+    # causes severe queue pressure and timeout cascades.
+    # We poll with a short sleep rather than blocking Redis BLPOP so Lambda stays alive.
+    VLLM_LOCK_KEY = "vllm_global_lock"
+    VLLM_LOCK_TTL = 900  # 15 min — same as Lambda max timeout
+    VLLM_WAIT_MAX = 840  # wait up to 14 min for the lock to free
+    VLLM_POLL_SEC = 15   # check every 15 seconds
+    _vllm_lock_acquired = False
+    try:
+        from redis_store import _get_client as _get_r
+        _r = _get_r()
+        _waited = 0
+        while _waited < VLLM_WAIT_MAX:
+            _vllm_lock_acquired = _r.set(
+                VLLM_LOCK_KEY, file_id, nx=True, ex=VLLM_LOCK_TTL
+            )
+            if _vllm_lock_acquired:
+                logger.info("vLLM global lock acquired for %s", file_id)
+                break
+            _owner = (_r.get(VLLM_LOCK_KEY) or b"").decode()
+            logger.info(
+                "vLLM busy (held by %s) — waiting %ds (elapsed=%ds)",
+                _owner, VLLM_POLL_SEC, _waited,
+            )
+            import time as _time; _time.sleep(VLLM_POLL_SEC)
+            _waited += VLLM_POLL_SEC
+        if not _vllm_lock_acquired:
+            logger.error("vLLM global lock wait timed out after %ds — proceeding anyway", _waited)
+    except Exception as _ve:
+        logger.warning("vLLM global lock unavailable: %s — proceeding without serialization", _ve)
+
     try:
         raw_text = _download_from_drive(file_id)
         logger.info("Downloaded %s: %d chars", file_name, len(raw_text))
@@ -1010,6 +1042,44 @@ def meeting_triage_cod(state: OrchestratorState) -> OrchestratorState:
         logger.info("No action items to triage")
         return state.model_copy(update={"meeting_triage": []})
 
+    # ── Pre-filter: skip CoD for vague items (owner=TBD or deadline=TBD) ─────
+    # Items with no clear owner or deadline are unlikely to become Jira tickets.
+    # Cap at 8 items max to stay safely within Lambda 15-min timeout.
+    COD_MAX_ITEMS = 8
+    concrete, vague = [], []
+    for ai in actions:
+        owner    = str(ai.get("owner", "TBD")).strip().upper()
+        deadline = str(ai.get("deadline", "TBD")).strip().upper()
+        if owner == "TBD" or deadline == "TBD":
+            vague.append(ai)
+        else:
+            concrete.append(ai)
+
+    cod_items     = concrete[:COD_MAX_ITEMS]
+    skipped_items = vague + concrete[COD_MAX_ITEMS:]
+
+    if skipped_items:
+        logger.info(
+            "CoD pre-filter: %d item(s) for CoD, %d item(s) skipped (TBD or over cap=%d)",
+            len(cod_items), len(skipped_items), COD_MAX_ITEMS,
+        )
+
+    default_triage = [
+        {
+            "owner":          ai.get("owner", "TBD"),
+            "task":           ai.get("task", ""),
+            "task_key":       str(ai.get("task", ""))[:80].lower().strip(),
+            "deadline":       ai.get("deadline", "TBD"),
+            "final_priority": "Medium",
+            "risk_summary":   "Skipped CoD pre-filter — TBD owner/deadline or over item cap.",
+            "deadline_note":  "On track",
+            "rationale":      "Pre-filter: defaulting to Medium.",
+        }
+        for ai in skipped_items
+    ]
+
+    actions = cod_items
+
     # Fix any bad discussed_at_sec values (epoch timestamps or invalid floats)
     transcript = state.transcript_processed or state.transcript_text or ""
     actions = _fix_discussed_at_sec(actions, transcript)
@@ -1049,7 +1119,12 @@ def meeting_triage_cod(state: OrchestratorState) -> OrchestratorState:
                     "deadline_note": "On track", "rationale": "CoD triage failed — defaulting to Medium.",
                 }
 
-    logger.info("CoD triage complete: %d item(s) classified [parallel]", len(triage_results))
+    # Merge CoD results with default triage for pre-filtered items
+    triage_results = triage_results + default_triage
+    logger.info(
+        "CoD triage complete: %d CoD classified + %d pre-filter defaults = %d total",
+        len(cod_items), len(default_triage), len(triage_results),
+    )
     return state.model_copy(update={"meeting_triage": triage_results})
 
 
@@ -1124,6 +1199,17 @@ def meeting_generate_artifacts(state: OrchestratorState) -> OrchestratorState:
     triage    = state.meeting_triage or []
     csv_bytes = _generate_csv(file_name, actions, triage)
     logger.info("Artifacts: CSV generated (%d action items). No ICS — handled by calendar agent.", len(actions))
+
+    # Release the global vLLM lock — inference + CoD are complete.
+    # The next queued transcript can now start processing.
+    try:
+        from redis_store import _get_client as _get_r
+        _r = _get_r()
+        _r.delete("vllm_global_lock")
+        logger.info("vLLM global lock released after artifact generation")
+    except Exception as _ve:
+        logger.warning("Could not release vLLM global lock: %s", _ve)
+
     return state.model_copy(update={"meeting_ics_bytes": None, "meeting_csv_bytes": csv_bytes})
 
 
@@ -1780,13 +1866,55 @@ def meeting_post_next_jira(state: OrchestratorState) -> OrchestratorState:
                     logger.warning("Could not update last skipped card: %s", ue)
             final_tickets = list(av.get("tickets_created", []))
             skipped_count = int(av.get("tickets_skipped", 0)) + 1  # count this skip
-            _send_consolidated_email(
-                tickets_created=final_tickets,
-                tickets_skipped=skipped_count,
-                file_name=av.get("file_name", "meeting"),
-                channel=state.channel_id or SLACK_NOTIFY_CHANNEL or "",
-                s3_key=av.get("s3_key", ""),
-            )
+            _s3_key_hold   = av.get("s3_key", "")
+            _channel_hold  = state.channel_id or SLACK_NOTIFY_CHANNEL or ""
+            _fname_hold    = av.get("file_name", "meeting")
+            CALENDAR_HOLD_TTL = 7200
+            hold_key = f"calendar_hold:{_s3_key_hold}"
+            _held = False
+            try:
+                from redis_store import _get_client as _get_r
+                _r = _get_r()
+                hold_payload = json.dumps({
+                    "tickets_created":  final_tickets,
+                    "tickets_skipped":  skipped_count,
+                    "file_name":        _fname_hold,
+                    "channel":          _channel_hold,
+                    "s3_key":           _s3_key_hold,
+                    "channel_id":       state.channel_id or "",
+                    "preview_ts":       state.preview_ts or "",
+                })
+                _r.set(hold_key, hold_payload, ex=CALENDAR_HOLD_TTL)
+                _held = True
+                logger.info(
+                    "meeting_post_next_jira: consolidated email held for calendar_done (key=%s)",
+                    hold_key,
+                )
+            except Exception as _he:
+                logger.warning("could not store calendar hold (%s) — sending immediately", _he)
+
+            if not _held:
+                _send_consolidated_email(
+                    tickets_created=final_tickets,
+                    tickets_skipped=skipped_count,
+                    file_name=_fname_hold,
+                    channel=_channel_hold,
+                    s3_key=_s3_key_hold,
+                )
+            else:
+                # Post calendar pending status to Slack
+                try:
+                    _slack = WebClient(token=SLACK_BOT_TOKEN)
+                    _slack.chat_postMessage(
+                        channel=_channel_hold,
+                        text=(
+                            "\U0001f4c5 *Calendar agent detecting conflicts...*\n"
+                            "_Checking participant calendars and selecting the best available slot. "
+                            "Consolidated email will be sent once the calendar event is confirmed._"
+                        ),
+                    )
+                except Exception as _se:
+                    logger.warning("could not post calendar pending message: %s", _se)
             return state
         logger.info("meeting_post_next_jira: no queue session, nothing to do")
         return state
@@ -2086,13 +2214,58 @@ def meeting_create_jira(state: OrchestratorState) -> OrchestratorState:
         file_name_for_email = value_dict.get("file_name", "meeting")
         channel_for_email = channel_id or SLACK_NOTIFY_CHANNEL or ""
 
-        _send_consolidated_email(
-            tickets_created=final_tickets,
-            tickets_skipped=skipped_count,
-            file_name=file_name_for_email,
-            channel=channel_for_email,
-            s3_key=s3_key_for_email,
-        )
+        # ── Hold consolidated email until calendar agent confirms ─────────────
+        # Store the pending email payload in Redis so calendar_done webhook
+        # can retrieve it and trigger the email with the calendar link included.
+        CALENDAR_HOLD_TTL = 7200  # 2 hours — matches SESSION_TTL_SECONDS
+        hold_key = f"calendar_hold:{s3_key_for_email}"
+        try:
+            from redis_store import _get_client as _get_r
+            _r = _get_r()
+            hold_payload = json.dumps({
+                "tickets_created":  final_tickets,
+                "tickets_skipped":  skipped_count,
+                "file_name":        file_name_for_email,
+                "channel":          channel_for_email,
+                "s3_key":           s3_key_for_email,
+                "channel_id":       channel_id or "",
+                "preview_ts":       state.preview_ts or "",
+            })
+            _r.set(hold_key, hold_payload, ex=CALENDAR_HOLD_TTL)
+            logger.info(
+                "meeting_create_jira: consolidated email held — waiting for calendar_done (key=%s)",
+                hold_key,
+            )
+        except Exception as _he:
+            logger.warning(
+                "meeting_create_jira: could not store calendar hold (%s) — sending email immediately",
+                _he,
+            )
+            _send_consolidated_email(
+                tickets_created=final_tickets,
+                tickets_skipped=skipped_count,
+                file_name=file_name_for_email,
+                channel=channel_for_email,
+                s3_key=s3_key_for_email,
+            )
+
+        # Update Slack to show calendar agent is working
+        if channel_id:
+            try:
+                _slack = WebClient(token=SLACK_BOT_TOKEN)
+                # Find the most recent message ts to update
+                # (the last Jira card was already marked — post a new status message)
+                _slack.chat_postMessage(
+                    channel=channel_id,
+                    text=(
+                        "\U0001f4c5 *Calendar agent detecting conflicts...*\n"
+                        "_Checking participant calendars and selecting the best available slot. "
+                        "Consolidated email will be sent once the calendar event is confirmed._"
+                    ),
+                )
+                logger.info("meeting_create_jira: posted calendar pending Slack message")
+            except Exception as _se:
+                logger.warning("meeting_create_jira: could not post calendar pending message: %s", _se)
 
     return state.model_copy(update={"meeting_jira_queue_session": remaining_session_id})
 
