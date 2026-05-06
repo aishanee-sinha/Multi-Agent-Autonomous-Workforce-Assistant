@@ -26,27 +26,24 @@ def main():
     for col in collections:
         print(f" - {col.name} (Count: {col.count()})")
 
-    # Let's peek into the slack_feedback collection if it exists
-    slack_col = [c for c in collections if c.name == "slack_feedback"]
-    if slack_col:
-        print("\n--- Latest 3 Slack Feedback Items ---")
-        col = slack_col[0]
-        results = col.peek(limit=3)
+    # Let's read ALL data from ALL collections
+    for col in collections:
+        if col.count() == 0:
+            continue
+            
+        print(f"\n--- ALL ITEMS IN {col.name.upper()} ---")
+        results = col.get()
         for i, (doc, meta, id) in enumerate(zip(results["documents"], results["metadatas"], results["ids"])):
             decision = meta.get("decision", "unknown")
             timestamp = meta.get("timestamp", "unknown")
-            print(f"\n[ID: {id}] | Decision: {decision} | Time: {timestamp}")
-            print(f" Prompt Snippet: {doc[:100]}...")
+            response_full = meta.get("response", "No response saved")
+            extra_meta = meta.get("extra", "No extra meta")
             
-            # Print parsed metadata if available
-            extra_meta = meta.get("extra", {})
-            if isinstance(extra_meta, str) and extra_meta.startswith("{"):
-                try:
-                    parsed = json.loads(extra_meta)
-                    if "jira_key" in parsed:
-                        print(f" Generated Jira: {parsed['jira_key']} ({parsed.get('jira_url', '')})")
-                except:
-                    pass
+            print(f"\n[ID: {id}] | Decision: {decision} | Time: {timestamp}")
+            print(f"Prompt: {doc}")
+            print(f"Response: {response_full}")
+            print(f"Metadata: {extra_meta}")
+            print("-" * 50)
 
 if __name__ == "__main__":
     main()
