@@ -154,41 +154,62 @@ def _load_slot_preferences() -> str | None:
 
         host = os.environ.get("CHROMADB_HOST", os.environ.get("EC2_IP", "localhost"))
         port = int(os.environ.get("CHROMADB_PORT", "8001"))
+        logger.info("_load_slot_preferences: connecting to ChromaDB at %s:%d", host, port)
         client = _chromadb.HttpClient(host=host, port=port)
 
         try:
             col = client.get_collection("calendar_feedback")
-        except Exception:
-            logger.info("_load_slot_preferences: calendar_feedback collection not found")
+            logger.info("_load_slot_preferences: found collection 'calendar_feedback' (%d doc(s))", col.count())
+        except Exception as exc:
+            logger.info("_load_slot_preferences: calendar_feedback collection not found — %s", exc)
             return None
 
         results = col.get()
-        if not results or not results.get("documents"):
+        raw_docs = results.get("documents") or []
+        logger.info("_load_slot_preferences: fetched %d document(s) from ChromaDB", len(raw_docs))
+        if not raw_docs:
+            logger.info("_load_slot_preferences: no documents — skipping preference injection")
             return None
 
         hour_counter: Counter = Counter()
         total = 0
+        skipped = 0
 
-        for doc in results["documents"]:
+        for doc in raw_docs:
             try:
                 data = json.loads(doc)
             except (json.JSONDecodeError, TypeError):
+                skipped += 1
                 continue
 
             meeting_start = data.get("meeting_start")
             if not meeting_start:
+                skipped += 1
                 continue
 
             try:
                 dt = datetime.fromisoformat(str(meeting_start))
                 hour_counter[dt.hour] += 1
                 total += 1
-            except Exception:
-                pass
+                logger.debug(
+                    "_load_slot_preferences: counted meeting_start=%s → hour=%d",
+                    meeting_start, dt.hour,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "_load_slot_preferences: could not parse meeting_start=%r — %s",
+                    meeting_start, exc,
+                )
+                skipped += 1
+
+        logger.info(
+            "_load_slot_preferences: parsed %d valid meeting_start(s), skipped %d doc(s)",
+            total, skipped,
+        )
 
         if total < 3:
             logger.info(
-                "_load_slot_preferences: only %d session(s) — skipping preference injection",
+                "_load_slot_preferences: only %d session(s) — need ≥3 for reliable signal, skipping injection",
                 total,
             )
             return None
@@ -202,10 +223,18 @@ def _load_slot_preferences() -> str | None:
             rate  = count / total * 100
             label = f"{hour % 12 or 12} {'AM' if hour < 12 else 'PM'}"
             lines.append(f"  {label:<8}: {count} meeting(s)  ({rate:.0f}% of all scheduled)")
+            logger.info(
+                "_load_slot_preferences:   %s → %d/%d meetings (%.0f%%)",
+                label, count, total, rate,
+            )
 
         lines.append(
             "TIEBREAKER: When candidate slots have equal conflict status, "
             "prefer slots whose start hour matches the most historically preferred hours above."
+        )
+        logger.info(
+            "_load_slot_preferences: preference context built — %d distinct hour bucket(s) across %d meeting(s)",
+            len(hour_counter), total,
         )
         return "\n".join(lines)
 
