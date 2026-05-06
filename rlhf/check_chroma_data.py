@@ -42,6 +42,9 @@ def main():
             response_full = meta.get("response", "No response saved")
             extra_meta = meta.get("extra", "No extra meta")
             
+            response_full = meta.get("response", "No response saved")
+            extra_meta = meta.get("extra", "No extra meta")
+            
             print(f"\n[ID: {id}] | Decision: {decision} | Time: {timestamp}")
             print(f"Prompt: {doc}")
             print(f"Response: {response_full}")
