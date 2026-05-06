@@ -138,6 +138,83 @@ class SlotVerdict(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Historical slot preferences from ChromaDB
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_slot_preferences() -> str | None:
+    """
+    Mirrors the hour-counting logic in check_chroma_data.summarize_calendar_feedback().
+    Reads calendar_feedback from ChromaDB, counts meeting_start hours of accepted
+    meetings, and returns a formatted context string for CoD prompts.
+    Returns None if ChromaDB is unreachable or fewer than 3 sessions exist.
+    """
+    try:
+        import chromadb as _chromadb
+        from collections import Counter
+
+        host = os.environ.get("CHROMADB_HOST", os.environ.get("EC2_IP", "localhost"))
+        port = int(os.environ.get("CHROMADB_PORT", "8001"))
+        client = _chromadb.HttpClient(host=host, port=port)
+
+        try:
+            col = client.get_collection("calendar_feedback")
+        except Exception:
+            logger.info("_load_slot_preferences: calendar_feedback collection not found")
+            return None
+
+        results = col.get()
+        if not results or not results.get("documents"):
+            return None
+
+        hour_counter: Counter = Counter()
+        total = 0
+
+        for doc in results["documents"]:
+            try:
+                data = json.loads(doc)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+            meeting_start = data.get("meeting_start")
+            if not meeting_start:
+                continue
+
+            try:
+                dt = datetime.fromisoformat(str(meeting_start))
+                hour_counter[dt.hour] += 1
+                total += 1
+            except Exception:
+                pass
+
+        if total < 3:
+            logger.info(
+                "_load_slot_preferences: only %d session(s) — skipping preference injection",
+                total,
+            )
+            return None
+
+        lines = [
+            f"=== HISTORICAL SLOT PREFERENCES (from {total} past scheduled meetings) ===",
+            "Hour-of-day preference (how often meetings were scheduled at each hour):",
+        ]
+        for hour in sorted(hour_counter, key=lambda h: -hour_counter[h]):
+            count = hour_counter[hour]
+            rate  = count / total * 100
+            label = f"{hour % 12 or 12} {'AM' if hour < 12 else 'PM'}"
+            lines.append(f"  {label:<8}: {count} meeting(s)  ({rate:.0f}% of all scheduled)")
+
+        lines.append(
+            "TIEBREAKER: When candidate slots have equal conflict status, "
+            "prefer slots whose start hour matches the most historically preferred hours above."
+        )
+        return "\n".join(lines)
+
+    except Exception as exc:
+        logger.warning("_load_slot_preferences: failed (non-fatal): %s", exc)
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Google Calendar helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -440,6 +517,7 @@ def _build_cod_context(
     participants: list[str],
     search_label: str,
     email_context: dict,
+    slot_prefs_text: str | None = None,
 ) -> str:
     """Build the shared context block for all three CoD rounds."""
     # --- Email intent section ---
@@ -471,6 +549,10 @@ def _build_cod_context(
                 f"  (start={s['start']})"
             )
 
+    if slot_prefs_text:
+        lines.append("")
+        lines.append(slot_prefs_text)
+
     return "\n".join(lines)
 
 
@@ -479,8 +561,9 @@ def _run_cod(
     participants: list[str],
     search_label: str,
     email_context: dict,
+    slot_prefs_text: str | None = None,
 ) -> SlotVerdict | None:
-    context = _build_cod_context(enriched_slots, participants, search_label, email_context)
+    context = _build_cod_context(enriched_slots, participants, search_label, email_context, slot_prefs_text)
 
     try:
         # ── Round 1: Proposer ────────────────────────────────────────────────
@@ -498,6 +581,9 @@ def _run_cod(
                 "  3. Among free slots, prefer mid-morning (10–11am) unless email says otherwise\n"
                 "  4. Only consider NON-URGENT/displaceable conflicts if no free slot exists\n"
                 "  5. Never pick a slot with an URGENT conflict\n"
+                "  6. TIEBREAKER — among slots with equal conflict status, prefer the slot "
+                "whose start hour has the highest historical selection rate from "
+                "HISTORICAL SLOT PREFERENCES (if present in context). Never override rules 1–5 for this.\n"
                 "Argue your choice in 1–3 sentences referencing the email context.\n"
                 "Return a SlotProposal with proposed_slot as the ISO 8601 start datetime from the list."
             )),
@@ -552,6 +638,9 @@ def _run_cod(
                 "  4. Among conflict slots, only accept NON-URGENT/displaceable ones\n"
                 "  5. Prefer earlier days and mid-morning when comparing across the week\n"
                 "  6. If fewer than 3 candidate slots exist, return as many as are available\n"
+                "  7. TIEBREAKER — when ranking slots with equal conflict status, rank higher "
+                "those whose start hour matches historically preferred hours from "
+                "HISTORICAL SLOT PREFERENCES (if present in context). Never override rules 1–6 for this.\n"
                 "Return a SlotVerdict with top_slots: a list of up to 3 RankedSlot objects.\n"
                 "Each RankedSlot has: start (ISO 8601), end (1 hour after start, ISO 8601), "
                 "reason (one sentence)."
@@ -700,8 +789,11 @@ def slot_cod(state: OrchestratorState) -> OrchestratorState:
         logger.info("slot_cod: no viable slots found — cod_top_slots set to []")
         return state.model_copy(update={"cod_top_slots": []})
 
-    # 5. Run Chain-of-Debate
-    verdict = _run_cod(candidate_slots, list(access_tokens.keys()), search_label, email_context)
+    # 5. Load historical hour preferences from ChromaDB and run Chain-of-Debate
+    slot_prefs_text = _load_slot_preferences()
+    if slot_prefs_text:
+        logger.info("slot_cod: injecting historical slot preferences into CoD context")
+    verdict = _run_cod(candidate_slots, list(access_tokens.keys()), search_label, email_context, slot_prefs_text)
     if not verdict or not verdict.top_slots:
         logger.warning("slot_cod: CoD returned no verdict — cod_top_slots set to []")
         return state.model_copy(update={"cod_top_slots": []})
